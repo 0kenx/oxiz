@@ -1745,6 +1745,27 @@ impl Solver {
                 self.add_arith_diseq_split_recursive(t, manager, visited);
                 self.add_arith_diseq_split_recursive(e, manager, visited);
             }
+            TermKind::Distinct(args) => {
+                // Generate a Lt/Gt disjunction for each numeric pair, mirroring the
+                // Not(Eq(...)) arm above so the arithmetic solver is aware of the
+                // disequality. `args` borrows from the owned `t` (not from `self` or
+                // `manager`), so no collection is needed before the mutable calls.
+                for (i, &lhs) in args.iter().enumerate() {
+                    let lhs_is_numeric = manager.get(lhs).is_some_and(|lt| {
+                        lt.sort == manager.sorts.int_sort || lt.sort == manager.sorts.real_sort
+                    });
+                    if !lhs_is_numeric {
+                        continue;
+                    }
+                    for &rhs in args[i + 1..].iter() {
+                        let lt_term = manager.mk_lt(lhs, rhs);
+                        let gt_term = manager.mk_gt(lhs, rhs);
+                        let lt_lit = self.encode(lt_term, manager);
+                        let gt_lit = self.encode(gt_term, manager);
+                        self.sat.add_clause([lt_lit, gt_lit]);
+                    }
+                }
+            }
             _ => {}
         }
     }
