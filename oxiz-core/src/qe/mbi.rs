@@ -287,10 +287,7 @@ impl MbiSolver {
             let prefix = self.conjoin(&formulas[..=i], manager);
             let suffix = self.conjoin(&formulas[i + 1..], manager);
 
-            match self.interpolate(prefix, suffix, manager) {
-                Some(interp) => interpolants.push(interp),
-                None => return None,
-            }
+            interpolants.push(self.interpolate(prefix, suffix, manager)?);
         }
 
         Some(interpolants)
