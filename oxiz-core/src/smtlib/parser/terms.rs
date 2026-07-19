@@ -2,7 +2,7 @@
 
 use super::super::lexer::TokenKind;
 use super::{Attribute, Parser, parse_decimal_to_rational};
-use crate::ast::TermId;
+use crate::ast::{RoundingMode, TermId};
 use crate::error::{OxizError, Result};
 #[allow(unused_imports)]
 use crate::prelude::*;
@@ -119,6 +119,18 @@ impl<'a> Parser<'a> {
         match s {
             "true" => Ok(self.manager.mk_true()),
             "false" => Ok(self.manager.mk_false()),
+            // SMT-LIB Strings theory regex constants. These are zero-argument
+            // regex operators that appear as bare symbols (e.g.
+            // `(re.* re.allchar)`), so without an explicit case they would be
+            // rejected by the strict-undeclared-symbol check below. oxiz's
+            // term layer models regexes as opaque uninterpreted applies (it
+            // has no dedicated RegEx sort), so we mint them as zero-argument
+            // applies of the same name — consistent with how compound regex
+            // operators (`re.*`, `re.++`, `re.union`, `re.range`, ...) are
+            // lowered today via the generic compound-operator fallback.
+            "re.allchar" | "re.all" | "re.none" | "re.empty" => {
+                Ok(self.manager.mk_apply(s, [], self.manager.sorts.bool_sort))
+            }
             _ => {
                 // Check bindings first
                 if let Some(&term) = self.bindings.get(s) {
@@ -401,6 +413,133 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse an indexed floating-point conversion operator whose first
+    /// argument is a `RoundingMode` symbol.
+    ///
+    /// SMT-LIB defines four such operators:
+    /// - `(_ to_fp e s)` — convert a `FloatingPoint`, `Real`, or signed
+    ///   `BitVec` source into `FloatingPoint(e, s)`. The source sort selects
+    ///   the concrete conversion (`mk_fp_to_fp` / `mk_real_to_fp` /
+    ///   `mk_sbv_to_fp`).
+    /// - `(_ to_fp_unsigned e s)` — convert an *unsigned* `BitVec` source
+    ///   into `FloatingPoint(e, s)` via `mk_ubv_to_fp`.
+    /// - `(_ fp.to_sbv w)` — convert a `FloatingPoint` into a signed
+    ///   `BitVec` of width `w` via `mk_fp_to_sbv`.
+    /// - `(_ fp.to_ubv w)` — convert a `FloatingPoint` into an unsigned
+    ///   `BitVec` of width `w` via `mk_fp_to_ubv`.
+    ///
+    /// All four take the form `((_ <name> <indices...>) <RM> <arg>)`, where
+    /// `<RM>` is one of `RNE`/`RNA`/`RTP`/`RTN`/`RTZ`. Without this helper
+    /// the bare `RNE` argument would fall through to the generic
+    /// indexed-operator path, which would try to parse it as an ordinary
+    /// term and reject it as an undeclared symbol (see the audit finding
+    /// that prompted this helper).
+    ///
+    /// Returns `Ok(Some(term))` when `name` matches one of the four FP
+    /// conversion operators, consuming the rounding mode, the source term,
+    /// and the closing `)` of the surrounding application. Returns
+    /// `Ok(None)` for any other `name`, leaving the lexer position
+    /// unchanged so the caller can fall through to the generic path.
+    fn parse_indexed_fp_conversion(
+        &mut self,
+        name: &str,
+        index_parts: &[String],
+    ) -> Result<Option<TermId>> {
+        // (eb, sb) for the `to_fp` family; `width` for the `fp.to_*bv` family.
+        let (eb, sb, width): (u32, u32, u32) = match name {
+            "to_fp" | "to_fp_unsigned" => {
+                if index_parts.len() != 2 {
+                    return Err(OxizError::ParseError {
+                        position: self.lexer.position(),
+                        message: format!(
+                            "(_ {name} ...) requires exactly 2 indices (eb sb), got {}",
+                            index_parts.len()
+                        ),
+                    });
+                }
+                let eb: u32 = index_parts[0].parse().map_err(|_| OxizError::ParseError {
+                    position: self.lexer.position(),
+                    message: format!(
+                        "invalid exponent width for (_ {name} ...): {}",
+                        index_parts[0]
+                    ),
+                })?;
+                let sb: u32 = index_parts[1].parse().map_err(|_| OxizError::ParseError {
+                    position: self.lexer.position(),
+                    message: format!(
+                        "invalid significand width for (_ {name} ...): {}",
+                        index_parts[1]
+                    ),
+                })?;
+                (eb, sb, 0)
+            }
+            "fp.to_sbv" | "fp.to_ubv" => {
+                if index_parts.len() != 1 {
+                    return Err(OxizError::ParseError {
+                        position: self.lexer.position(),
+                        message: format!(
+                            "(_ {name} ...) requires exactly 1 index (width), got {}",
+                            index_parts.len()
+                        ),
+                    });
+                }
+                let w: u32 = index_parts[0].parse().map_err(|_| OxizError::ParseError {
+                    position: self.lexer.position(),
+                    message: format!(
+                        "invalid bit-vector width for (_ {name} ...): {}",
+                        index_parts[0]
+                    ),
+                })?;
+                (0, 0, w)
+            }
+            _ => return Ok(None),
+        };
+
+        // First argument is always a RoundingMode symbol; parse it before
+        // the source term so the bare `RNE`/`RTN`/etc. is not mistaken for
+        // an undeclared constant.
+        let rm: RoundingMode = self.parse_rounding_mode()?;
+        let arg = self.parse_term()?;
+        self.expect_rparen()?; // close the surrounding application
+
+        let result = match name {
+            "to_fp" => {
+                // Dispatch on the source sort. SMT-LIB `(_ to_fp e s)` is
+                // overloaded across FloatingPoint / Real / signed-BitVec;
+                // integers are accepted by coercing through Real, matching
+                // how the printer emits Real->FP using the same `to_fp`
+                // syntax.
+                let src_kind = self
+                    .manager
+                    .get(arg)
+                    .and_then(|t| self.manager.sorts.get(t.sort))
+                    .map(|s| s.kind.clone());
+                match src_kind {
+                    Some(SortKind::FloatingPoint { .. }) => {
+                        self.manager.mk_fp_to_fp(rm, arg, eb, sb)
+                    }
+                    Some(SortKind::Real) | Some(SortKind::Int) => {
+                        self.manager.mk_real_to_fp(rm, arg, eb, sb)
+                    }
+                    Some(SortKind::BitVec(_)) => self.manager.mk_sbv_to_fp(rm, arg, eb, sb),
+                    _ => {
+                        // Unknown / uninterpreted source sort: lower to an
+                        // uninterpreted apply with the correct result sort,
+                        // rather than silently producing a Bool-sorted term.
+                        let func = format!("(_ to_fp {eb} {sb})");
+                        let sort = self.manager.sorts.float_sort(eb, sb);
+                        self.manager.mk_apply(&func, std::iter::once(arg), sort)
+                    }
+                }
+            }
+            "to_fp_unsigned" => self.manager.mk_ubv_to_fp(rm, arg, eb, sb),
+            "fp.to_sbv" => self.manager.mk_fp_to_sbv(rm, arg, width),
+            "fp.to_ubv" => self.manager.mk_fp_to_ubv(rm, arg, width),
+            _ => unreachable!("guarded by the match above"),
+        };
+        Ok(Some(result))
+    }
+
     pub(super) fn parse_compound_term(&mut self) -> Result<TermId> {
         let op_token = self
             .lexer
@@ -496,6 +635,15 @@ impl<'a> Parser<'a> {
             // Parse arguments first so indexed operators with real handling
             // (BV extend/rotate/repeat, divisible) can be lowered to concrete
             // terms instead of degrading to a Bool-sorted uninterpreted apply.
+            //
+            // FP conversion operators (`to_fp`, `to_fp_unsigned`,
+            // `fp.to_sbv`, `fp.to_ubv`) are special-cased first because their
+            // first argument is a RoundingMode symbol, not a term, so the
+            // generic `parse_term_list` below would reject `RNE`/`RTN`/etc.
+            // as undeclared constants.
+            if let Some(term) = self.parse_indexed_fp_conversion(&name, &index_parts)? {
+                return Ok(term);
+            }
             let args = self.parse_term_list()?;
             if let Some(term) = self.build_indexed_op(&name, &index_parts, &args)? {
                 return Ok(term);
@@ -613,6 +761,15 @@ impl<'a> Parser<'a> {
                     // For unrecognized indexed identifiers, expect the closing
                     // paren of the `(_ name indices)` head, then parse args.
                     self.expect_rparen()?;
+
+                    // FP conversion operators (`to_fp`, `to_fp_unsigned`,
+                    // `fp.to_sbv`, `fp.to_ubv`) take a RoundingMode symbol as
+                    // their first argument, which the generic
+                    // `parse_term_list` below would reject as an undeclared
+                    // constant; special-case them first.
+                    if let Some(term) = self.parse_indexed_fp_conversion(&name, &index_parts)? {
+                        return Ok(term);
+                    }
 
                     // Parse arguments first so indexed operators with real
                     // handling (BV extend/rotate/repeat, divisible) can be

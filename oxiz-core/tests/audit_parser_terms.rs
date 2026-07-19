@@ -11,7 +11,7 @@
 //! 4. Indexed BV ops (`zero_extend`, `sign_extend`, `rotate_*`, `repeat`)
 //!    degraded to Bool-sorted generic applies.
 
-use oxiz_core::ast::{TermKind, TermManager};
+use oxiz_core::ast::{RoundingMode, TermKind, TermManager};
 use oxiz_core::smtlib::{Command, parse_script};
 use oxiz_core::sort::SortKind;
 
@@ -331,4 +331,221 @@ fn deeply_nested_term_errors_instead_of_overflowing() {
         parse_script(&script, &mut manager).is_err(),
         "deep nesting should be rejected by the depth guard"
     );
+}
+
+// ---------------------------------------------------------------------------
+// FP indexed conversion operators take a RoundingMode as their first argument.
+// Previously the bare `RNE`/`RNA`/... symbol fell through to the generic
+// indexed-operator path and was rejected as an undeclared constant, regressing
+// every QF_FP benchmark that uses `((_ to_fp e s) RNE ...)`. These tests pin
+// the four SMT-LIB FP conversion operators and confirm source-sort dispatch.
+// ---------------------------------------------------------------------------
+
+/// Walk the asserted terms of a script and return the first sub-term whose
+/// `TermKind` matches `pred`, panicking with a helpful message if none is
+/// found. Recurses into children so that e.g. a conversion nested inside an
+/// `(= ...)` assertion is still located.
+fn first_assert_kind<F: Fn(&TermKind) -> bool>(
+    m: &TermManager,
+    asserts: &[oxiz_core::ast::TermId],
+    pred: F,
+    what: &str,
+) -> oxiz_core::ast::TermId {
+    for &t in asserts {
+        if let Some(id) = find_first_id(m, t, &pred) {
+            return id;
+        }
+    }
+    panic!(
+        "no assert matched {what}; top-level kinds were: {:?}",
+        asserts.iter().map(|t| kind(m, *t)).collect::<Vec<_>>()
+    )
+}
+
+/// Recursive search returning the TermId of the first sub-term whose kind
+/// satisfies `pred`.
+fn find_first_id<F: Fn(&TermKind) -> bool>(
+    m: &TermManager,
+    t: oxiz_core::ast::TermId,
+    pred: &F,
+) -> Option<oxiz_core::ast::TermId> {
+    let k = kind(m, t);
+    if pred(&k) {
+        return Some(t);
+    }
+    let children = oxiz_core::ast::traversal::get_children(&k);
+    for c in children {
+        if let Some(id) = find_first_id(m, c, pred) {
+            return Some(id);
+        }
+    }
+    None
+}
+
+#[test]
+fn to_fp_from_real_uses_real_to_fp_and_keeps_rounding_mode() {
+    // ((_ to_fp 8 24) RNE 1.5) over a Real source must lower to RealToFp
+    // with rounding mode RNE — not a Bool-sorted apply, and not a parse error.
+    let (m, asserts) = parse_asserts(
+        r#"
+        (declare-const r Real)
+        (assert (= ((_ to_fp 8 24) RNA r) ((_ to_fp 8 24) RNA 1.5)))
+        "#,
+    );
+    let conv = first_assert_kind(
+        &m,
+        &asserts,
+        |k| matches!(k, TermKind::RealToFp { .. }),
+        "RealToFp",
+    );
+    match kind(&m, conv) {
+        TermKind::RealToFp { rm, eb, sb, .. } => {
+            assert_eq!(rm, RoundingMode::RNA, "rounding mode dropped/wrong");
+            assert_eq!((eb, sb), (8, 24), "wrong FP format");
+        }
+        other => panic!("expected RealToFp, got {other:?}"),
+    }
+}
+
+#[test]
+fn to_fp_from_float_uses_fp_to_fp() {
+    // ((_ to_fp 11 53) RTN x) where x is Float64 must lower to FpToFp.
+    let (m, asserts) = parse_asserts(
+        r#"
+        (declare-const x (_ FloatingPoint 11 53))
+        (assert (= ((_ to_fp 8 24) RTN x) x))
+        "#,
+    );
+    let conv = first_assert_kind(
+        &m,
+        &asserts,
+        |k| matches!(k, TermKind::FpToFp { .. }),
+        "FpToFp",
+    );
+    match kind(&m, conv) {
+        TermKind::FpToFp { rm, eb, sb, .. } => {
+            assert_eq!(rm, RoundingMode::RTN);
+            assert_eq!((eb, sb), (8, 24));
+        }
+        other => panic!("expected FpToFp, got {other:?}"),
+    }
+}
+
+#[test]
+fn to_fp_from_bv_is_signed_and_to_fp_unsigned_is_unsigned() {
+    // `(_ to_fp e s)` over a BitVec is the SIGNED conversion, while
+    // `(_ to_fp_unsigned e s)` is the UNSIGNED one.
+    let (m, asserts) = parse_asserts(
+        r#"
+        (declare-const b (_ BitVec 32))
+        (assert (= ((_ to_fp 8 24) RNE b) ((_ to_fp_unsigned 8 24) RNE b)))
+        "#,
+    );
+    first_assert_kind(
+        &m,
+        &asserts,
+        |k| matches!(k, TermKind::SBVToFp { .. }),
+        "SBVToFp (signed to_fp)",
+    );
+    first_assert_kind(
+        &m,
+        &asserts,
+        |k| matches!(k, TermKind::UBVToFp { .. }),
+        "UBVToFp (to_fp_unsigned)",
+    );
+}
+
+#[test]
+fn fp_to_sbv_and_fp_to_ubv_parse_with_rounding_mode() {
+    let (m, asserts) = parse_asserts(
+        r#"
+        (declare-const x (_ FloatingPoint 8 24))
+        (assert (= ((_ fp.to_sbv 32) RTP x) ((_ fp.to_ubv 32) RTP x)))
+        "#,
+    );
+    let sbv = first_assert_kind(
+        &m,
+        &asserts,
+        |k| matches!(k, TermKind::FpToSBV { .. }),
+        "FpToSBV",
+    );
+    let ubv = first_assert_kind(
+        &m,
+        &asserts,
+        |k| matches!(k, TermKind::FpToUBV { .. }),
+        "FpToUBV",
+    );
+    match kind(&m, sbv) {
+        TermKind::FpToSBV { rm, width, .. } => {
+            assert_eq!(rm, RoundingMode::RTP);
+            assert_eq!(width, 32);
+        }
+        other => panic!("expected FpToSBV, got {other:?}"),
+    }
+    match kind(&m, ubv) {
+        TermKind::FpToUBV { rm, width, .. } => {
+            assert_eq!(rm, RoundingMode::RTP);
+            assert_eq!(width, 32);
+        }
+        other => panic!("expected FpToUBV, got {other:?}"),
+    }
+}
+
+#[test]
+fn to_fp_rejects_wrong_arity() {
+    // `(_ to_fp e)` (one index) is malformed and must be a parse error,
+    // not a silent wrong-sort term.
+    let mut manager = TermManager::new();
+    let script = "(declare-const r Real)(assert (= ((_ to_fp 8) RNE r) ((_ to_fp 8) RNE r)))";
+    assert!(
+        parse_script(script, &mut manager).is_err(),
+        "(_ to_fp e) with one index must be rejected"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SMT-LIB Strings regex constants (`re.allchar` etc.) are zero-argument
+// operators that previously hit the strict-undeclared-symbol check, regressing
+// every QF_S benchmark that uses `(re.* re.allchar)`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn regex_constants_parse_as_zero_arg_applies() {
+    // All four documented SMT-LIB regex constants must parse without being
+    // rejected as undeclared symbols. They are minted as zero-argument apply
+    // terms (oxiz has no dedicated RegEx sort), consistent with how compound
+    // regex operators are lowered today.
+    for sym in ["re.allchar", "re.all", "re.none", "re.empty"] {
+        let (m, asserts) = parse_asserts(&format!(
+            "(declare-const s String)(assert (str.in_re s (re.* {sym})))"
+        ));
+        // The apply for the constant is nested inside re.* inside str.in_re;
+        // walk the asserted term to find an Apply whose resolved name matches.
+        let mut found = false;
+        for &t in &asserts {
+            walk(&m, t, &mut |k| {
+                if let TermKind::Apply { func, args } = k
+                    && m.resolve_str(*func) == sym
+                    && args.is_empty()
+                {
+                    found = true;
+                }
+            });
+            if found {
+                break;
+            }
+        }
+        assert!(found, "bare `{sym}` did not parse as a zero-arg apply");
+    }
+}
+
+/// Pre-order walk of a term's `TermKind` sub-tree, invoking `f` on every
+/// node's kind. Used by the regex-constant test to find the apply node deep
+/// inside `(str.in_re s (re.* <const>))`.
+fn walk<F: FnMut(&TermKind)>(m: &TermManager, t: oxiz_core::ast::TermId, f: &mut F) {
+    let kind = m.get(t).expect("term exists").kind.clone();
+    f(&kind);
+    for child in oxiz_core::ast::traversal::get_children(&kind) {
+        walk(m, child, f);
+    }
 }
