@@ -496,6 +496,19 @@ impl Solver {
 
     /// Assert a term
     pub fn assert(&mut self, term: TermId, manager: &mut TermManager) {
+        // Simplify up front so the recorded `assertions` list mirrors what
+        // we actually encode. This matters for the theory-atom honesty gates
+        // (`fp_atoms_need_theory` / `string_atoms_need_theory`): they walk
+        // `self.assertions` looking for residual theory atoms, and a
+        // ground FP operation like `fp.gt (fp.add RNE 1.5 2.3) 3.7` should
+        // be recorded as its folded `true`/`false` value (no theory atom)
+        // after the constant folder runs, not as the original un-folded form.
+        let term = if self.config.simplify {
+            self.simplifier.simplify(term, manager)
+        } else {
+            term
+        };
+
         let index = self.assertions.len();
         self.assertions.push(term);
         self.trail.push(TrailOp::AssertionAdded { index });
@@ -562,12 +575,10 @@ impl Solver {
             return;
         }
 
-        // Apply simplification if enabled
-        let term_to_encode = if self.config.simplify {
-            self.simplifier.simplify(term, manager)
-        } else {
-            term
-        };
+        // Simplification already ran at the top of this function (so the
+        // value stored in `self.assertions` mirrors what we encode); reuse
+        // the simplified term here.
+        let term_to_encode = term;
 
         // Check again if simplification produced a constant
         if let Some(t) = manager.get(term_to_encode) {

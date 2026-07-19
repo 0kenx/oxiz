@@ -264,8 +264,142 @@ impl Context {
         self.solver.assert(term, &mut self.terms);
     }
 
+    /// Pre-solve constant-substitution pass.
+    ///
+    /// Walks [`Self::assertions`] looking for `(= var const)` facts, builds a
+    /// variable -> constant substitution map (iterating to a fixpoint so that
+    /// chains like `(= x 1) (=_ y x)` collapse to `y -> 1`), and — if any
+    /// substitution was found — resets the solver and re-asserts every
+    /// assertion with the substitution applied and simplified.
+    ///
+    /// Sound because the substitution is grounded in *asserted* equalities:
+    /// any model of the re-asserted set is a model of the original (substitute
+    /// the constant back for the variable) and vice versa. Scoped to the base
+    /// assertion level (`Self::assertion_stack` empty) because the reset would
+    /// otherwise scrub push/pop state.
+    fn propagate_constant_subst(&mut self) {
+        use oxiz_core::ast::TermKind;
+        if !self.assertion_stack.is_empty() {
+            return;
+        }
+
+        // Iterate to a fixpoint: start with an empty substitution, and on each
+        // pass apply the current substitution to every assertion, simplify it
+        // (which invokes the FP/String folder), and look for new `(= var const)`
+        // facts unlocked by the substitution. Chains like `(= x c1) (= y x)`
+        // collapse to `y -> c1` in a couple of passes.
+        let original_assertions = self.assertions.clone();
+        let mut subst: FxHashMap<TermId, TermId> = FxHashMap::default();
+        loop {
+            let mut grew = false;
+            for &a in &original_assertions {
+                // Apply the current substitution, then simplify. This is what
+                // lets `((_ to_fp 8 24) RNE 1.5)` fold to a ground `FpLit` so
+                // the matcher below can recognise it as a constant RHS, and
+                // what lets `fp.add(RNE, x, y)` fold once `x` and `y` are
+                // substituted by their constant values.
+                let substituted = self.terms.substitute(a, &subst);
+                let simplified = self.solver.simplify_term(substituted, &mut self.terms);
+                let Some(t) = self.terms.get(simplified) else {
+                    continue;
+                };
+                let TermKind::Eq(lhs, rhs) = t.kind else {
+                    continue;
+                };
+                let lhs_is_var = self
+                    .terms
+                    .get(lhs)
+                    .is_some_and(|t| matches!(t.kind, TermKind::Var(_)));
+                let rhs_is_var = self
+                    .terms
+                    .get(rhs)
+                    .is_some_and(|t| matches!(t.kind, TermKind::Var(_)));
+                // Only substitute when ALL of the following hold:
+                //
+                //   1. The variable and the constant share the same sort. A
+                //      cross-sort equality like `(= x_int 3.5_real)` is not
+                //      SMT-LIB well-typed, but the LIA theory catches the
+                //      integer-vs-fractional mismatch as a conflict —
+                //      substituting `x_int` with `3.5_real` would
+                //      short-circuit that detection and produce a wrong Sat.
+                //
+                //   2. That sort is FloatingPoint or String. These are the
+                //      only theories whose operations the constant folder can
+                //      evaluate, so substitution is the only way to expose
+                //      the constant to the folder. For BitVec / Int / Real /
+                //      Bool the existing theory pipeline handles equalities
+                //      directly; substituting would only succeed in *removing*
+                //      the variable from the assertion set, which breaks
+                //      `get-model` (the variable would no longer be in the
+                //      model — `bv = (_ bv200 8)` would come back as
+                //      `bv = #x00`).
+                let is_substitutable_sort = |t: TermId| -> bool {
+                    self.terms
+                        .get(t)
+                        .and_then(|term| self.terms.sorts.get(term.sort))
+                        .is_some_and(|s| {
+                            matches!(
+                                s.kind,
+                                oxiz_core::sort::SortKind::FloatingPoint { .. }
+                                    | oxiz_core::sort::SortKind::String
+                            )
+                        })
+                };
+                let can_subst = |v: TermId, c: TermId| -> bool {
+                    is_ground_const(c, &self.terms)
+                        && is_substitutable_sort(v)
+                        && sorts_match(v, c, &self.terms)
+                };
+                if lhs_is_var && can_subst(lhs, rhs) {
+                    if subst.insert(lhs, rhs).is_none() {
+                        grew = true;
+                    }
+                } else if rhs_is_var && can_subst(rhs, lhs) {
+                    if subst.insert(rhs, lhs).is_none() {
+                        grew = true;
+                    }
+                }
+            }
+            if !grew {
+                break;
+            }
+            // Defensive: every iteration adds at least one binding or stops.
+            if subst.len() > original_assertions.len() * 2 + 16 {
+                break;
+            }
+        }
+        if subst.is_empty() {
+            return;
+        }
+
+        // Apply the final substitution to every assertion, then simplify.
+        // Re-assert through `Self::assert` so both `self.assertions` and the
+        // solver's encoding stay in sync; `Self::assert` invokes the
+        // simplifier (with the FP/String folder), so any operation whose
+        // operands are now constants gets evaluated.
+        let original = std::mem::take(&mut self.assertions);
+        self.solver.reset();
+        for term in original {
+            let substituted = self.terms.substitute(term, &subst);
+            self.assert(substituted);
+        }
+    }
+
     /// Check satisfiability
     pub fn check_sat(&mut self) -> SolverResult {
+        // Eager constant substitution (soundness-preserving, base-scope only):
+        // scan the assertion set for `(= var const)` facts and propagate the
+        // constants into every other assertion before solving. This is what
+        // lets the FP/String constant folder (see `theory_fold`) evaluate
+        // fully-ground theory operations like `fp.gt (fp.add RNE 1.5 2.3)
+        // 3.7` — without this pass the folder never sees the constants
+        // because they arrive as separate `(= x c)` assertions.
+        //
+        // Triggered only when (a) we are at the base scope (no `push`), so
+        // the reset-and-reassert below is sound, and (b) at least one
+        // `(= var const)` fact is present. Otherwise it is a no-op.
+        self.propagate_constant_subst();
+
         let mut result = self.solver.check(&mut self.terms);
 
         // Array soundness honesty gate: the syntactic array checks and the EUF
@@ -1930,5 +2064,70 @@ mod tests {
         assert_eq!(output.len(), 2);
         assert_eq!(output[0], "unsat");
         assert!(output[1].contains("error") || output[1].contains("No model"));
+    }
+}
+
+/// Follow a substitution chain `t -> subst[t] -> subst[subst[t]] -> ...` until
+/// it terminates at a non-substituted term. Used by [`Context::propagate_constant_subst`]
+/// so that a chain like `(= x c) (= y x)` resolves `y` all the way to `c` in a
+/// single fixpoint sweep.
+#[allow(dead_code)]
+fn resolve_chain(
+    mut t: oxiz_core::ast::TermId,
+    subst: &FxHashMap<oxiz_core::ast::TermId, oxiz_core::ast::TermId>,
+    _manager: &TermManager,
+) -> oxiz_core::ast::TermId {
+    let mut steps = 0;
+    while let Some(&next) = subst.get(&t) {
+        if next == t {
+            break;
+        }
+        t = next;
+        steps += 1;
+        // Defensive: a substitution cycle (which should be impossible since we
+        // only insert vars -> constants, but cheap to guard).
+        if steps > 65_536 {
+            break;
+        }
+    }
+    t
+}
+
+/// Is `term` a ground constant that [`Context::propagate_constant_subst`] can
+/// safely substitute a variable for? True for every numeric / FP / string /
+/// Boolean literal kind — i.e. terms with no free variables that the FP/String
+/// folder can evaluate from.
+fn is_ground_const(t: oxiz_core::ast::TermId, manager: &TermManager) -> bool {
+    use oxiz_core::ast::TermKind;
+    let Some(term) = manager.get(t) else {
+        return false;
+    };
+    matches!(
+        term.kind,
+        TermKind::IntConst(_)
+            | TermKind::RealConst(_)
+            | TermKind::BitVecConst { .. }
+            | TermKind::FpLit { .. }
+            | TermKind::FpPlusInfinity { .. }
+            | TermKind::FpMinusInfinity { .. }
+            | TermKind::FpPlusZero { .. }
+            | TermKind::FpMinusZero { .. }
+            | TermKind::FpNaN { .. }
+            | TermKind::StringLit(_)
+            | TermKind::True
+            | TermKind::False
+    )
+}
+
+/// Check whether two terms have the same sort (helper for
+/// [`Context::propagate_constant_subst`]).
+fn sorts_match(
+    a: oxiz_core::ast::TermId,
+    b: oxiz_core::ast::TermId,
+    manager: &TermManager,
+) -> bool {
+    match (manager.get(a), manager.get(b)) {
+        (Some(ta), Some(tb)) => ta.sort == tb.sort,
+        _ => false,
     }
 }

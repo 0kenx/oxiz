@@ -357,6 +357,26 @@ impl Simplifier {
                     return manager.mk_true();
                 }
 
+                // Two *different* ground constants of the same sort are
+                // provably unequal: distinct interned terms under hash-consing
+                // imply distinct values for `IntConst`/`RealConst`/`BitVecConst`/
+                // `FpLit`/`StringLit`/special-FP/`True`/`False`. Folding this
+                // to `false` here is what lets the constant-substitution pass
+                // catch contradictions like `(= result (str.replace_all ...))`
+                // ∧ `(= result "banana")` once the substitution evaluates the
+                // `str.replace_all` to a different string literal.
+                if let (Some(lhs_term), Some(rhs_term)) =
+                    (manager.get(lhs_simplified), manager.get(rhs_simplified))
+                {
+                    if lhs_term.sort == rhs_term.sort
+                        && Self::is_ground_const_kind(&lhs_term.kind)
+                        && Self::is_ground_const_kind(&rhs_term.kind)
+                    {
+                        self.stats.contradictions_found += 1;
+                        return manager.mk_false();
+                    }
+                }
+
                 // Check for constant simplifications
                 if let (Some(lhs_term), Some(rhs_term)) =
                     (manager.get(lhs_simplified), manager.get(rhs_simplified))
@@ -448,8 +468,94 @@ impl Simplifier {
                 }
             }
 
+            // ===== Floating-point and String constant folding =====
+            // These theory operations are opaque to the rest of the simplifier.
+            // Simplify their children, rebuild, then offer the result to
+            // [`crate::theory_fold::try_fold`] which evaluates any fully-ground
+            // operation to a constant using rounding-mode-aware IEEE 754 /
+            // string-theory semantics. Folding is a tautology: it can never
+            // introduce a wrong answer, only expose one already forced.
+            TermKind::FpAbs(_)
+            | TermKind::FpNeg(_)
+            | TermKind::FpSqrt(_, _)
+            | TermKind::FpRoundToIntegral(_, _)
+            | TermKind::FpAdd(_, _, _)
+            | TermKind::FpSub(_, _, _)
+            | TermKind::FpMul(_, _, _)
+            | TermKind::FpDiv(_, _, _)
+            | TermKind::FpRem(_, _)
+            | TermKind::FpMin(_, _)
+            | TermKind::FpMax(_, _)
+            | TermKind::FpLeq(_, _)
+            | TermKind::FpLt(_, _)
+            | TermKind::FpGeq(_, _)
+            | TermKind::FpGt(_, _)
+            | TermKind::FpEq(_, _)
+            | TermKind::FpFma(_, _, _, _)
+            | TermKind::FpIsNormal(_)
+            | TermKind::FpIsSubnormal(_)
+            | TermKind::FpIsZero(_)
+            | TermKind::FpIsInfinite(_)
+            | TermKind::FpIsNaN(_)
+            | TermKind::FpIsNegative(_)
+            | TermKind::FpIsPositive(_)
+            | TermKind::FpToFp { .. }
+            | TermKind::FpToSBV { .. }
+            | TermKind::FpToUBV { .. }
+            | TermKind::FpToReal(_)
+            | TermKind::RealToFp { .. }
+            | TermKind::SBVToFp { .. }
+            | TermKind::UBVToFp { .. }
+            | TermKind::StrConcat(_, _)
+            | TermKind::StrLen(_)
+            | TermKind::StrSubstr(_, _, _)
+            | TermKind::StrAt(_, _)
+            | TermKind::StrContains(_, _)
+            | TermKind::StrPrefixOf(_, _)
+            | TermKind::StrSuffixOf(_, _)
+            | TermKind::StrIndexOf(_, _, _)
+            | TermKind::StrReplace(_, _, _)
+            | TermKind::StrReplaceAll(_, _, _)
+            | TermKind::StrToInt(_)
+            | TermKind::IntToStr(_) => {
+                let simplified = self.simplify_theory_children(term, &t.kind, manager);
+                match crate::theory_fold::try_fold(simplified, manager) {
+                    Some(folded) => folded,
+                    None => simplified,
+                }
+            }
+
             // For other term kinds, just return the original
             _ => term,
+        }
+    }
+
+    /// Recursively simplify the child `TermId`s of a theory term, rebuilding
+    /// it via the manager's substitution machinery. Used by the FP/String
+    /// folding arm above so that e.g. `fp.add(rm, x, y)` first has `x` and
+    /// `y` simplified before [`crate::theory_fold::try_fold`] attempts to
+    /// evaluate it.
+    fn simplify_theory_children(
+        &mut self,
+        term: TermId,
+        kind: &TermKind,
+        manager: &mut TermManager,
+    ) -> TermId {
+        let children = oxiz_core::ast::traversal::get_children(kind);
+        if children.is_empty() {
+            return term;
+        }
+        let mut subst: FxHashMap<TermId, TermId> = FxHashMap::default();
+        for child in children {
+            let simplified = self.simplify(child, manager);
+            if simplified != child {
+                subst.insert(child, simplified);
+            }
+        }
+        if subst.is_empty() {
+            term
+        } else {
+            manager.substitute(term, &subst)
         }
     }
 
@@ -732,6 +838,28 @@ impl Simplifier {
             }
             _ => {}
         }
+    }
+
+    /// Returns `true` if `kind` is a ground constant (a literal with no free
+    /// variables): numeric, bit-vector, FP, string, or Boolean. Used by the
+    /// `Eq` arm of [`Self::simplify_impl`] to fold equalities between two
+    /// distinct ground constants of the same sort to `false`.
+    fn is_ground_const_kind(kind: &TermKind) -> bool {
+        matches!(
+            kind,
+            TermKind::IntConst(_)
+                | TermKind::RealConst(_)
+                | TermKind::BitVecConst { .. }
+                | TermKind::FpLit { .. }
+                | TermKind::FpPlusInfinity { .. }
+                | TermKind::FpMinusInfinity { .. }
+                | TermKind::FpPlusZero { .. }
+                | TermKind::FpMinusZero { .. }
+                | TermKind::FpNaN { .. }
+                | TermKind::StringLit(_)
+                | TermKind::True
+                | TermKind::False
+        )
     }
 }
 

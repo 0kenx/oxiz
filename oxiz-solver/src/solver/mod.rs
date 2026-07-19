@@ -1209,6 +1209,14 @@ impl Solver {
         }
     }
 
+    /// Simplify a term using the solver's pre-encoding simplifier (with the
+    /// FP/String constant folder wired in). Exposed so [`crate::Context`] can
+    /// pre-simplify assertion terms during the constant-substitution pass.
+    #[must_use]
+    pub fn simplify_term(&mut self, term: TermId, manager: &mut TermManager) -> TermId {
+        self.simplifier.simplify(term, manager)
+    }
+
     /// Get the number of assertions in the solver
     #[must_use]
     pub fn num_assertions(&self) -> usize {

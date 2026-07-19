@@ -103,6 +103,7 @@ mod simplify;
 #[cfg(feature = "std")]
 pub mod skolemization;
 mod solver;
+mod theory_fold;
 
 pub use context::Context;
 pub use nelson_oppen::{NelsonOppenCombiner, NelsonOppenStats, TheoryId};
