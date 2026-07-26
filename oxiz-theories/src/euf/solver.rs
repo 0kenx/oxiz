@@ -719,108 +719,119 @@ impl EufSolver {
 
     /// Explain why two nodes are equal.
     ///
-    /// Uses BFS through the proof forest to find a path from `a` to `b`.
-    /// Reusable buffers (`explain_queue`, `explain_visited`, `explain_parent`) are
-    /// moved out of `self` via `mem::take` at entry and restored at exit so that
-    /// recursive calls (for congruence sub-explanations) each work on a fresh,
-    /// independently sized set of buffers without re-allocating from the heap once
-    /// the buffers are warm.
+    /// Iterative BFS through the proof forest.  Congruence edges enqueue their
+    /// argument pairs onto a worklist rather than recursing, so a cycle in the
+    /// congruence/argument graph (e.g. explaining `x=y` via `f(x)=f(y)` which
+    /// needs `x=y` again) cannot overflow the call stack — issue #18.
+    ///
+    /// Results are memoized in `expl_cache` (cleared on every merge/pop/reset).
     fn explain_equality(&mut self, a: u32, b: u32) -> Vec<TermId> {
         if a == b {
             return Vec::new();
         }
 
+        let key = if a <= b { (a, b) } else { (b, a) };
+        if let Some(cached) = self.expl_cache.get(&key) {
+            return cached.clone();
+        }
+
         let n = self.proof_forest.len();
-        // Guard against out-of-bounds indices
         if (a as usize) >= n || (b as usize) >= n {
             return Vec::new();
         }
 
-        // Take reusable buffers out of self so recursive calls (for congruence
-        // sub-explanations) do not conflict with the current borrow.
+        // Worklist of unordered pairs still to explain.  `done` breaks cycles:
+        // once a pair is scheduled we never expand it again.
+        let mut work: Vec<(u32, u32)> = vec![(a, b)];
+        let mut done: FxHashSet<(u32, u32)> = FxHashSet::default();
+        done.insert(key);
+
+        let mut reasons: Vec<TermId> = Vec::new();
+
+        // Take reusable BFS buffers once for the whole worklist.
         let mut queue = mem::take(&mut self.explain_queue);
         let mut visited = mem::take(&mut self.explain_visited);
         let mut parent = mem::take(&mut self.explain_parent);
 
-        // Reset / resize in-place — existing heap capacity is retained.
-        queue.clear();
-        visited.clear();
-        visited.resize(n, false);
-        parent.clear();
-        parent.resize(n, None);
-
-        // BFS to find path from a to b
-        queue.push_back(a);
-        visited[a as usize] = true;
-
-        let mut found = false;
-        while let Some(node) = queue.pop_front() {
-            if node == b {
-                found = true;
-                break;
-            }
-
-            if (node as usize) >= self.proof_forest.len() {
+        while let Some((src, dst)) = work.pop() {
+            if src == dst {
                 continue;
             }
-            for (idx, edge) in self.proof_forest[node as usize].iter().enumerate() {
-                let other_idx = edge.other as usize;
-                if other_idx < n && !visited[other_idx] {
-                    visited[other_idx] = true;
-                    parent[other_idx] = Some((node, idx));
-                    queue.push_back(edge.other);
-                }
+            let n = self.proof_forest.len();
+            if (src as usize) >= n || (dst as usize) >= n {
+                continue;
             }
-        }
 
-        if !found {
-            // Restore buffers before returning so they are available for the next call.
-            self.explain_queue = queue;
-            self.explain_visited = visited;
-            self.explain_parent = parent;
-            return Vec::new();
-        }
+            queue.clear();
+            visited.clear();
+            visited.resize(n, false);
+            parent.clear();
+            parent.resize(n, None);
 
-        // Collect the (prev, edge_idx) pairs from the parent chain into a local
-        // Vec before dropping the parent borrow — this lets us recursively call
-        // explain_equality below without conflicting with `parent`.
-        let mut path: Vec<(u32, usize)> = Vec::new();
-        let mut current = b;
-        while let Some((prev, edge_idx)) = parent[current as usize] {
-            path.push((prev, edge_idx));
-            current = prev;
-        }
+            queue.push_back(src);
+            visited[src as usize] = true;
 
-        // Restore buffers now — recursive calls may reuse them safely.
-        self.explain_queue = queue;
-        self.explain_visited = visited;
-        self.explain_parent = parent;
-
-        // Reconstruct path and collect reasons
-        let mut reasons = Vec::new();
-
-        for (prev, edge_idx) in path {
-            let reason = self.proof_forest[prev as usize][edge_idx].reason.clone();
-
-            match reason {
-                MergeReason::Assertion(term_id) => {
-                    if term_id.raw() != 0 && !reasons.contains(&term_id) {
-                        reasons.push(term_id);
+            let mut found = false;
+            while let Some(node) = queue.pop_front() {
+                if node == dst {
+                    found = true;
+                    break;
+                }
+                if (node as usize) >= self.proof_forest.len() {
+                    continue;
+                }
+                for (idx, edge) in self.proof_forest[node as usize].iter().enumerate() {
+                    let other_idx = edge.other as usize;
+                    if other_idx < n && !visited[other_idx] {
+                        visited[other_idx] = true;
+                        parent[other_idx] = Some((node, idx));
+                        queue.push_back(edge.other);
                     }
                 }
-                MergeReason::Congruence { term1, term2 } => {
-                    // For congruence, we need to explain why the arguments are equal
-                    let args1: SmallVec<[u32; 4]> = self.nodes[term1 as usize].args.clone();
-                    let args2: SmallVec<[u32; 4]> = self.nodes[term2 as usize].args.clone();
+            }
 
-                    // Recursively explain argument equalities
-                    for (&arg1, &arg2) in args1.iter().zip(args2.iter()) {
-                        if arg1 != arg2 && self.uf.same_no_compress(arg1, arg2) {
-                            let arg_reasons = self.explain_equality(arg1, arg2);
-                            for r in arg_reasons {
-                                if !reasons.contains(&r) {
-                                    reasons.push(r);
-                                }
+            if !found {
+                continue;
+            }
+
+            // Walk parent chain dst → src, collecting edges.
+            let mut path: Vec<(u32, usize)> = Vec::new();
+            let mut current = dst;
+            while let Some((prev, edge_idx)) = parent[current as usize] {
+                path.push((prev, edge_idx));
+                current = prev;
+            }
+
+            for (prev, edge_idx) in path {
+                let reason = self.proof_forest[prev as usize][edge_idx].reason.clone();
+                match reason {
+                    MergeReason::Assertion(term_id) => {
+                        if term_id.raw() != 0 && !reasons.contains(&term_id) {
+                            reasons.push(term_id);
+                        }
+                    }
+                    MergeReason::Congruence { term1, term2 } => {
+                        let t1 = term1 as usize;
+                        let t2 = term2 as usize;
+                        if t1 >= self.nodes.len() || t2 >= self.nodes.len() {
+                            continue;
+                        }
+                        let args1 = self.nodes[t1].args.clone();
+                        let args2 = self.nodes[t2].args.clone();
+                        for (&arg1, &arg2) in args1.iter().zip(args2.iter()) {
+                            if arg1 == arg2 {
+                                continue;
+                            }
+                            if !self.uf.same_no_compress(arg1, arg2) {
+                                continue;
+                            }
+                            let pk = if arg1 <= arg2 {
+                                (arg1, arg2)
+                            } else {
+                                (arg2, arg1)
+                            };
+                            if done.insert(pk) {
+                                work.push((arg1, arg2));
                             }
                         }
                     }
@@ -828,6 +839,11 @@ impl EufSolver {
             }
         }
 
+        self.explain_queue = queue;
+        self.explain_visited = visited;
+        self.explain_parent = parent;
+
+        self.expl_cache.insert(key, reasons.clone());
         reasons
     }
 
@@ -1369,6 +1385,35 @@ mod tests {
             // Should contain the equality reason that caused congruence
             assert!(reasons.contains(&TermId::new(21)));
         }
+    }
+
+    /// Nested applications create congruence edges whose argument explanations
+    /// can re-enter the same pair (issue #18).  The iterative explainer must
+    /// terminate and still produce a conflict.
+    #[test]
+    fn test_euf_explanation_nested_congruence_no_stack_overflow() {
+        let mut solver = EufSolver::new();
+
+        let a = solver.intern(TermId::new(1));
+        let b = solver.intern(TermId::new(2));
+        let fa = solver.intern_app(TermId::new(3), 0, [a]);
+        let fb = solver.intern_app(TermId::new(4), 0, [b]);
+        let ffa = solver.intern_app(TermId::new(5), 0, [fa]);
+        let ffb = solver.intern_app(TermId::new(6), 0, [fb]);
+        let g_ffa = solver.intern_app(TermId::new(7), 1, [ffa, a]);
+        let g_ffb = solver.intern_app(TermId::new(8), 1, [ffb, b]);
+
+        solver.assert_diseq(g_ffa, g_ffb, TermId::new(30));
+        solver.merge(a, b, TermId::new(31)).unwrap_or(());
+
+        let conflict = solver.check_conflicts();
+        assert!(
+            conflict.is_some(),
+            "nested congruence + diseq must conflict without overflowing"
+        );
+        let reasons = conflict.unwrap();
+        assert!(reasons.contains(&TermId::new(30)));
+        assert!(reasons.contains(&TermId::new(31)));
     }
 
     #[test]
