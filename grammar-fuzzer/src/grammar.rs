@@ -15,13 +15,17 @@
 //!
 //! | Logic | SMT-LIB | Sorts | Notes |
 //! |-------|---------|-------|-------|
-//! | `QfLia`  | `QF_LIA` | `Int`  | linear (constant·var only), `abs`, comparisons, `distinct`, `ite` |
-//! | `QfLra`  | `QF_LRA` | `Real` | linear, decimal literals, comparisons |
-//! | `QfBv`   | `QF_BV`  | `(_ BitVec W)` | bitwise/arith/shift ops, signed & unsigned compares |
+//! | `QfLia`  | `QF_LIA` | `Int`  | linear, `abs`, `div`/`mod` (non-zero divisor), `ite` |
+//! | `QfLra`  | `QF_LRA` | `Real` | linear, decimal literals, `/` |
+//! | `QfNia`  | `QF_NIA` | `Int`  | nonlinear (var·var allowed) |
+//! | `QfNra`  | `QF_NRA` | `Real` | nonlinear |
+//! | `QfBv`   | `QF_BV`  | `(_ BitVec W)` | bitwise/arith/shift, signed & unsigned compares |
 //! | `QfUf`   | `QF_UF`  | uninterpreted `U` | congruence/equality over uninterpreted funs |
-//! | `Lia`    | `LIA`    | `Int`  | adds `forall`/`exists` quantifiers (shallow bodies) |
+//! | `QfA`    | `QF_AUFLIA` | `(Array Int Int)` | `select`/`store`, extensionality |
+//! | `QfS`    | `QF_S`   | `String` | `str.++`/`at`/`substr`/`replace`, `len`, `contains`, … |
+//! | `Lia`    | `LIA`    | `Int`  | adds `forall`/`exists` (shallow bodies) |
 //!
-//! Arithmetic division/mod is only ever generated with a **non-zero numeral**
+//! Integer division/mod is only ever generated with a **non-zero numeral**
 //! divisor, sidestepping the SMT-LIB divide-by-zero edge case where solvers
 //! have historically disagreed (and would create noise rather than signal).
 
@@ -33,8 +37,12 @@ use std::fmt::Write as _;
 pub enum Logic {
     QfLia,
     QfLra,
+    QfNia,
+    QfNra,
     QfBv,
     QfUf,
+    QfA,
+    QfS,
     /// Quantified linear integer arithmetic (`forall`/`exists`).
     Lia,
 }
@@ -45,20 +53,50 @@ impl Logic {
         match self {
             Logic::QfLia => "QF_LIA",
             Logic::QfLra => "QF_LRA",
+            Logic::QfNia => "QF_NIA",
+            Logic::QfNra => "QF_NRA",
             Logic::QfBv => "QF_BV",
             Logic::QfUf => "QF_UF",
+            Logic::QfA => "QF_AUFLIA",
+            Logic::QfS => "QF_S",
             Logic::Lia => "LIA",
         }
     }
 
     /// All logics, in a fixed canonical order.
-    pub const ALL: [Logic; 5] = [
+    pub const ALL: [Logic; 9] = [
         Logic::QfLia,
         Logic::QfLra,
+        Logic::QfNia,
+        Logic::QfNra,
         Logic::QfBv,
         Logic::QfUf,
+        Logic::QfA,
+        Logic::QfS,
         Logic::Lia,
     ];
+
+    /// `true` for logics over `Real` arithmetic.
+    pub fn is_real(self) -> bool {
+        matches!(self, Logic::QfLra | Logic::QfNra)
+    }
+
+    /// `true` for logics whose arithmetic may include variable·variable
+    /// products (the nonlinear fragments).
+    pub fn is_nonlinear(self) -> bool {
+        matches!(self, Logic::QfNia | Logic::QfNra)
+    }
+
+    /// `true` when a sat model assigns **concrete scalar values** to every
+    /// declared variable (so a `get-value` model can be grounded and
+    /// re-checked). Arrays and uninterpreted functions are excluded because
+    /// their models are stores/function-graphs rather than atoms.
+    pub fn has_scalar_models(self) -> bool {
+        matches!(
+            self,
+            Logic::QfLia | Logic::QfLra | Logic::QfNia | Logic::QfNra | Logic::QfBv | Logic::QfS
+        )
+    }
 
     /// Parse a comma-separated list of logic names (case-insensitive, accepts
     /// both `QfLia` and `QF_LIA`); `None` if any token is unrecognized.
@@ -69,8 +107,12 @@ impl Logic {
             let logic = match norm.as_str() {
                 "QF_LIA" | "QFLIA" => Logic::QfLia,
                 "QF_LRA" | "QFLRA" => Logic::QfLra,
+                "QF_NIA" | "QFNIA" => Logic::QfNia,
+                "QF_NRA" | "QFNRA" => Logic::QfNra,
                 "QF_BV" | "QFBV" => Logic::QfBv,
                 "QF_UF" | "QFUF" => Logic::QfUf,
+                "QF_A" | "QFA" | "QF_AUFLIA" | "QFAUFLIA" => Logic::QfA,
+                "QF_S" | "QFS" => Logic::QfS,
                 "LIA" => Logic::Lia,
                 _ => return None,
             };
@@ -86,8 +128,7 @@ impl std::fmt::Display for Logic {
     }
 }
 
-/// Knobs that control generator size/depth. Larger values explore more of the
-/// formula space at the cost of slower solves and more timeouts.
+/// Knobs that control generator size/depth.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub max_term_depth: u32,
@@ -100,10 +141,6 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        // Deliberately larger than `bench/z3_parity`'s generator (depth 2,
-        // 2-4 vars): depth 3, up to 5 vars and 6 assertions exercises nested
-        // `ite`/boolean structure while keeping typical solves well under a
-        // second.
         Config {
             max_term_depth: 3,
             max_formula_depth: 3,
@@ -116,29 +153,34 @@ impl Default for Config {
 }
 
 /// A generated script plus the metadata needed to reproduce and report it.
+/// `vars` lists every top-level declared constant name (used by the
+/// model-validity oracle to issue a `get-value` query and ground the result).
 #[derive(Debug, Clone)]
 pub struct Script {
     pub logic: Logic,
     pub seed: u64,
-    /// The full SMT-LIB2 source.
     pub source: String,
+    pub vars: Vec<String>,
 }
 
 /// Generate one fully deterministic script. `generate(logic, seed, cfg)` is a
 /// pure function of its arguments.
 pub fn generate(logic: Logic, seed: u64, cfg: &Config) -> Script {
     let mut rng = Rng::new(seed);
-    let source = match logic {
-        Logic::QfLia => gen_linear_arith(&mut rng, false, false, cfg),
-        Logic::QfLra => gen_linear_arith(&mut rng, true, false, cfg),
-        Logic::Lia => gen_linear_arith(&mut rng, false, true, cfg),
+    let (source, vars) = match logic {
+        Logic::QfLia | Logic::QfLra | Logic::QfNia | Logic::QfNra | Logic::Lia => {
+            gen_arith_logic(&mut rng, logic, cfg)
+        }
         Logic::QfBv => gen_bv(&mut rng, cfg),
         Logic::QfUf => gen_uf(&mut rng, cfg),
+        Logic::QfA => gen_array(&mut rng, cfg),
+        Logic::QfS => gen_string(&mut rng, cfg),
     };
     Script {
         logic,
         seed,
         source,
+        vars,
     }
 }
 
@@ -147,8 +189,7 @@ pub fn generate(logic: Logic, seed: u64, cfg: &Config) -> Script {
 // =====================================================================
 
 /// Build a Boolean formula of the given depth whose leaves are produced by
-/// `atom`. Connectives: `and`, `or`, `not`, `=>`, `xor`, and (rarely) `ite`
-/// over booleans.
+/// `atom`. Connectives: `and`, `or`, `not`, `=>`, `xor`, and `ite`.
 fn gen_bool<F>(rng: &mut Rng, depth: u32, atom: &mut F) -> String
 where
     F: FnMut(&mut Rng) -> String,
@@ -188,11 +229,9 @@ where
 }
 
 // =====================================================================
-// QF_LIA / QF_LRA / LIA: linear arithmetic over Int/Real
+// Arithmetic: Int/Real, linear or nonlinear (QF_LIA/LRA/NIA/NRA/LIA)
 // =====================================================================
 
-/// Emit a non-negative numeral / decimal. SMT-LIB literals are never written
-/// with a leading `-`; a negative value is spelled `(- N)`.
 fn arith_const(rng: &mut Rng, is_real: bool) -> String {
     let magnitude = rng.range_i64(0, 12);
     let negative = rng.chance(1, 3) && magnitude != 0;
@@ -209,12 +248,11 @@ fn arith_const(rng: &mut Rng, is_real: bool) -> String {
     }
 }
 
-/// A **non-zero** arithmetic constant; used as a safe divisor / multiplier to
-/// keep us inside the linear fragment and away from divide-by-zero semantics.
+/// A **non-zero** arithmetic constant (safe divisor/multiplier; keeps linear
+/// fragments linear and avoids divide-by-zero divergence between solvers).
 fn nonzero_arith_const(rng: &mut Rng, is_real: bool) -> String {
     loop {
         let c = arith_const(rng, is_real);
-        // `arith_const` may yield `(- 0)` which is zero; skip those.
         if !c.contains("(- 0") && c != "0" && c != "0.0" {
             return c;
         }
@@ -225,8 +263,8 @@ fn gen_arith_term(
     rng: &mut Rng,
     vars: &[String],
     is_real: bool,
+    nonlinear: bool,
     depth: u32,
-    bound: &[String],
 ) -> String {
     if depth == 0 || rng.chance(1, 3) {
         return gen_arith_leaf(rng, vars, is_real);
@@ -235,28 +273,32 @@ fn gen_arith_term(
         0 => {
             let n = rng.range_u32(2, 3) as usize;
             let parts: Vec<String> = (0..n)
-                .map(|_| gen_arith_term(rng, vars, is_real, depth - 1, bound))
+                .map(|_| gen_arith_term(rng, vars, is_real, nonlinear, depth - 1))
                 .collect();
             format!("(+ {})", parts.join(" "))
         }
         1 => {
-            let a = gen_arith_term(rng, vars, is_real, depth - 1, bound);
-            let b = gen_arith_term(rng, vars, is_real, depth - 1, bound);
+            let a = gen_arith_term(rng, vars, is_real, nonlinear, depth - 1);
+            let b = gen_arith_term(rng, vars, is_real, nonlinear, depth - 1);
             format!("(- {a} {b})")
         }
         2 => {
-            // Scalar multiplication only -> stays linear (no var*var).
-            let c = arith_const(rng, is_real);
-            let a = gen_arith_term(rng, vars, is_real, depth - 1, bound);
-            format!("(* {c} {a})")
+            // Multiplication. Linear fragments restrict the first factor to a
+            // numeral; nonlinear fragments allow variable·subterm.
+            if nonlinear && !vars.is_empty() && rng.chance(1, 2) {
+                let v = vars[rng.index(vars.len())].clone();
+                let a = gen_arith_term(rng, vars, is_real, nonlinear, depth - 1);
+                format!("(* {v} {a})")
+            } else {
+                let c = arith_const(rng, is_real);
+                let a = gen_arith_term(rng, vars, is_real, nonlinear, depth - 1);
+                format!("(* {c} {a})")
+            }
         }
         3 => {
-            // Division by a non-zero constant only: avoids both nonlinearity
-            // and the divide-by-zero edge case where solvers have disagreed.
-            // SMT-LIB spelling depends on the sort: `div` is Int-only, `/`
-            // is the Real division operator.
+            // Division by a non-zero constant. `div` is Int-only; `/` is Real.
             let d = nonzero_arith_const(rng, is_real);
-            let a = gen_arith_term(rng, vars, is_real, depth - 1, bound);
+            let a = gen_arith_term(rng, vars, is_real, nonlinear, depth - 1);
             if is_real {
                 format!("(/ {a} {d})")
             } else {
@@ -264,11 +306,9 @@ fn gen_arith_term(
             }
         }
         4 => {
-            // `mod` is an Int-only operator in SMT-LIB (z3 rejects
-            // `(mod x 2.0)` as a sort error). For Real we emit real division
-            // instead so the script stays standard-conformant.
+            // `mod` is Int-only; Real reuses real division.
             let d = nonzero_arith_const(rng, is_real);
-            let a = gen_arith_term(rng, vars, is_real, depth - 1, bound);
+            let a = gen_arith_term(rng, vars, is_real, nonlinear, depth - 1);
             if is_real {
                 format!("(/ {a} {d})")
             } else {
@@ -276,29 +316,24 @@ fn gen_arith_term(
             }
         }
         5 => {
-            // `abs` is an Int-only op in SMT-LIB; for Real, fall through to a
-            // plain negation so we never emit an ill-typed term.
+            // `abs` is Int-only; Real falls back to unary negation.
+            let a = gen_arith_term(rng, vars, is_real, nonlinear, depth - 1);
             if is_real {
-                let a = gen_arith_term(rng, vars, is_real, depth - 1, bound);
                 format!("(- {a})")
             } else {
-                let a = gen_arith_term(rng, vars, is_real, depth - 1, bound);
                 format!("(abs {a})")
             }
         }
         _ => {
-            // if-then-else on terms, with a boolean condition.
-            let cond = gen_bool(rng, 1, &mut |r| gen_arith_atom(r, vars, is_real, bound));
-            let a = gen_arith_term(rng, vars, is_real, depth - 1, bound);
-            let b = gen_arith_term(rng, vars, is_real, depth - 1, bound);
+            let cond = gen_bool(rng, 1, &mut |r| gen_arith_atom(r, vars, is_real, nonlinear));
+            let a = gen_arith_term(rng, vars, is_real, nonlinear, depth - 1);
+            let b = gen_arith_term(rng, vars, is_real, nonlinear, depth - 1);
             format!("(ite {cond} {a} {b})")
         }
     }
 }
 
 fn gen_arith_leaf(rng: &mut Rng, vars: &[String], is_real: bool) -> String {
-    // 50/50 between a declared variable and a constant; bound quantifier
-    // variables are equally eligible so quantified bodies stay well-scoped.
     let pool: Vec<&String> = vars.iter().collect();
     if !pool.is_empty() && rng.chance(1, 2) {
         pool[rng.index(pool.len())].clone()
@@ -309,108 +344,86 @@ fn gen_arith_leaf(rng: &mut Rng, vars: &[String], is_real: bool) -> String {
 
 const ARITH_REL_OPS: [&str; 6] = ["=", "<", "<=", ">", ">=", "distinct"];
 
-fn gen_arith_atom(rng: &mut Rng, vars: &[String], is_real: bool, bound: &[String]) -> String {
+fn gen_arith_atom(rng: &mut Rng, vars: &[String], is_real: bool, nonlinear: bool) -> String {
     let op = ARITH_REL_OPS[rng.index(ARITH_REL_OPS.len())];
-    // `distinct` is variadic; the rest are binary. Generating 2-3 operands
-    // keeps it simple and well-typed.
     let arity = if op == "distinct" {
         rng.range_u32(2, 3) as usize
     } else {
         2
     };
     let parts: Vec<String> = (0..arity)
-        .map(|_| gen_arith_term(rng, vars, is_real, MAX_TERM_DEPTH_LOCAL, bound))
+        .map(|_| gen_arith_term(rng, vars, is_real, nonlinear, MAX_TERM_DEPTH_LOCAL))
         .collect();
     format!("({op} {})", parts.join(" "))
 }
 
-// Local shorthand so atom builders don't each need `cfg` threaded through.
-const MAX_TERM_DEPTH_LOCAL: u32 = 2;
+/// Quantifier body over the given scope (declared vars + bound vars).
+fn gen_arith_atom_scoped(
+    rng: &mut Rng,
+    scope: &[String],
+    is_real: bool,
+    nonlinear: bool,
+) -> String {
+    gen_arith_atom(rng, scope, is_real, nonlinear)
+}
 
-fn gen_linear_arith(rng: &mut Rng, is_real: bool, allow_quant: bool, cfg: &Config) -> String {
+/// A `forall`/`exists` over 1-2 bound Int variables with a shallow body that
+/// may reference both bound and declared variables.
+fn gen_quantified(rng: &mut Rng, free_vars: &[String], is_real: bool, cfg: &Config) -> String {
+    let nbound = rng.range_u32(1, 2) as usize;
+    let bound: Vec<String> = (0..nbound).map(|i| format!("y{i}")).collect();
     let sort = if is_real { "Real" } else { "Int" };
+    let mut scope: Vec<String> = free_vars.to_vec();
+    scope.extend(bound.iter().cloned());
+    let body = gen_bool(
+        rng,
+        cfg.max_formula_depth.saturating_sub(1).max(1),
+        &mut |r| gen_arith_atom_scoped(r, &scope, is_real, false),
+    );
+    let binder = if rng.coin() { "forall" } else { "exists" };
+    let decls: Vec<String> = bound.iter().map(|b| format!("({b} {sort})")).collect();
+    format!("({binder} ({}) {body})", decls.join(" "))
+}
+
+fn gen_arith_logic(rng: &mut Rng, logic: Logic, cfg: &Config) -> (String, Vec<String>) {
+    let is_real = logic.is_real();
+    let nonlinear = logic.is_nonlinear();
+    let allow_quant = logic == Logic::Lia;
+    let sort = if is_real { "Real" } else { "Int" };
+
     let num_vars = rng.range_u32(cfg.min_vars as u32, cfg.max_vars as u32) as usize;
     let vars: Vec<String> = (0..num_vars).map(|i| format!("x{i}")).collect();
     let num_asserts = rng.range_u32(cfg.min_asserts as u32, cfg.max_asserts as u32) as usize;
 
     let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "; grammar-fuzzer ({} seed-by-caller)",
-        Logic::from_real(is_real, allow_quant).name()
-    );
-    let _ = writeln!(
-        out,
-        "(set-logic {})",
-        Logic::from_real(is_real, allow_quant).name()
-    );
+    let _ = writeln!(out, "; grammar-fuzzer ({logic} seed-by-caller)");
+    let _ = writeln!(out, "(set-logic {logic})");
     for v in &vars {
         let _ = writeln!(out, "(declare-const {v} {sort})");
     }
     for _ in 0..num_asserts {
-        // Most assertions are quantifier-free; a minority (only when the
-        // logic is `LIA`) wrap a quantifier around a shallow body so the
-        // benchmark actually exercises quantifier reasoning.
         let formula = if allow_quant && rng.chance(1, 4) {
             gen_quantified(rng, &vars, is_real, cfg)
         } else {
             gen_bool(rng, cfg.max_formula_depth, &mut |r| {
-                gen_arith_atom(r, &vars, is_real, &[])
+                gen_arith_atom(r, &vars, is_real, nonlinear)
             })
         };
         let _ = writeln!(out, "(assert {formula})");
     }
     let _ = writeln!(out, "(check-sat)");
     let _ = writeln!(out, "(exit)");
-    out
-}
-
-/// A `forall`/`exists` over 1-2 freshly bound Int variables, with a shallow
-/// boolean body that may reference both the bound vars and the declared ones.
-fn gen_quantified(rng: &mut Rng, free_vars: &[String], is_real: bool, cfg: &Config) -> String {
-    let nbound = rng.range_u32(1, 2) as usize;
-    let bound: Vec<String> = (0..nbound).map(|i| format!("y{i}")).collect();
-    let sort = if is_real { "Real" } else { "Int" };
-
-    // Scope visible to the body: declared vars + bound vars.
-    let mut scope: Vec<String> = free_vars.to_vec();
-    scope.extend(bound.iter().cloned());
-
-    let body = gen_bool(
-        rng,
-        cfg.max_formula_depth.saturating_sub(1).max(1),
-        &mut |r| gen_arith_atom(r, &scope, is_real, &bound),
-    );
-
-    let binder = if rng.coin() { "forall" } else { "exists" };
-    let decls: Vec<String> = bound.iter().map(|b| format!("({b} {sort})")).collect();
-    format!("({binder} ({}) {body})", decls.join(" "))
-}
-
-impl Logic {
-    /// Helper used only by the linear-arithmetic generator to recover the
-    /// public `Logic` from its `(is_real, allow_quant)` dispatch arguments.
-    fn from_real(is_real: bool, allow_quant: bool) -> Logic {
-        match (is_real, allow_quant) {
-            (false, false) => Logic::QfLia,
-            (true, false) => Logic::QfLra,
-            (false, true) => Logic::Lia,
-            (true, true) => Logic::QfLra, // unreachable: we never call this with (true,true)
-        }
-    }
+    (out, vars)
 }
 
 // =====================================================================
 // QF_BV: fixed bit-width bit-vectors
 // =====================================================================
 
-/// Width-preserving binary BV ops.
 const BV_BINOPS: [&str; 9] = [
     "bvadd", "bvsub", "bvmul", "bvand", "bvor", "bvxor", "bvshl", "bvlshr", "bvashr",
 ];
-/// Division-like ops; only generated with a **non-zero constant** divisor.
 const BV_DIVOPS: [&str; 4] = ["bvudiv", "bvurem", "bvsdiv", "bvsrem"];
-/// Signed & unsigned comparisons.
 const BV_REL_OPS: [&str; 10] = [
     "=", "distinct", "bvult", "bvule", "bvugt", "bvuge", "bvslt", "bvsle", "bvsgt", "bvsge",
 ];
@@ -425,7 +438,6 @@ fn bv_const(rng: &mut Rng, width: u32) -> String {
     format!("#b{value:0width$b}")
 }
 
-/// A non-zero BV constant of `width` bits (avoids divide-by-zero noise).
 fn nonzero_bv_const(rng: &mut Rng, width: u32) -> String {
     loop {
         let c = bv_const(rng, width);
@@ -443,7 +455,6 @@ fn gen_bv_term(rng: &mut Rng, vars: &[String], width: u32, depth: u32) -> String
             bv_const(rng, width)
         }
     } else if rng.chance(1, 6) {
-        // Unary: bitwise not or two's-complement negation.
         let a = gen_bv_term(rng, vars, width, depth - 1);
         if rng.coin() {
             format!("(bvnot {a})")
@@ -451,7 +462,6 @@ fn gen_bv_term(rng: &mut Rng, vars: &[String], width: u32, depth: u32) -> String
             format!("(bvneg {a})")
         }
     } else if rng.chance(1, 5) {
-        // Division-like op with a non-zero constant divisor.
         let op = BV_DIVOPS[rng.index(BV_DIVOPS.len())];
         let d = nonzero_bv_const(rng, width);
         let a = gen_bv_term(rng, vars, width, depth - 1);
@@ -477,8 +487,7 @@ fn gen_bv_atom(rng: &mut Rng, vars: &[String], width: u32) -> String {
     format!("({op} {})", parts.join(" "))
 }
 
-fn gen_bv(rng: &mut Rng, cfg: &Config) -> String {
-    // Fixed width per script keeps every subterm uniformly typed.
+fn gen_bv(rng: &mut Rng, cfg: &Config) -> (String, Vec<String>) {
     let width = *rng.pick(&[4u32, 8, 16]);
     let num_vars = rng.range_u32(cfg.min_vars as u32, cfg.max_vars as u32) as usize;
     let vars: Vec<String> = (0..num_vars).map(|i| format!("x{i}")).collect();
@@ -498,7 +507,7 @@ fn gen_bv(rng: &mut Rng, cfg: &Config) -> String {
     }
     let _ = writeln!(out, "(check-sat)");
     let _ = writeln!(out, "(exit)");
-    out
+    (out, vars)
 }
 
 // =====================================================================
@@ -525,7 +534,7 @@ fn gen_uf_atom(rng: &mut Rng, consts: &[String]) -> String {
     format!("({op} {lhs} {rhs})")
 }
 
-fn gen_uf(rng: &mut Rng, cfg: &Config) -> String {
+fn gen_uf(rng: &mut Rng, cfg: &Config) -> (String, Vec<String>) {
     let num_consts = rng.range_u32(3, 5) as usize;
     let consts: Vec<String> = (0..num_consts).map(|i| format!("c{i}")).collect();
     let num_asserts = rng.range_u32(cfg.min_asserts as u32, cfg.max_asserts as u32) as usize;
@@ -545,8 +554,211 @@ fn gen_uf(rng: &mut Rng, cfg: &Config) -> String {
     }
     let _ = writeln!(out, "(check-sat)");
     let _ = writeln!(out, "(exit)");
-    out
+    // UF models are function graphs, not scalar atoms -> excluded from the
+    // model-validity oracle.
+    (out, Vec::new())
 }
+
+// =====================================================================
+// QF_A: arrays of Int -> Int
+// =====================================================================
+
+/// Array-typed term: a declared array, or `(store arr i v)`.
+fn gen_array_term(rng: &mut Rng, arrays: &[String], idxvars: &[String], depth: u32) -> String {
+    if depth == 0 || rng.chance(1, 2) {
+        arrays[rng.index(arrays.len())].clone()
+    } else {
+        let a = gen_array_term(rng, arrays, idxvars, depth - 1);
+        let i = gen_small_int_term(rng, idxvars);
+        let v = gen_small_int_term(rng, idxvars);
+        format!("(store {a} {i} {v})")
+    }
+}
+
+/// A small linear Int term used as an array index/value.
+fn gen_small_int_term(rng: &mut Rng, idxvars: &[String]) -> String {
+    gen_arith_term(rng, idxvars, false, false, 1)
+}
+
+fn gen_array_atom(rng: &mut Rng, arrays: &[String], idxvars: &[String]) -> String {
+    let kind = rng.index(3);
+    match kind {
+        0 => {
+            // equality/distinct of two array-typed terms (exercises
+            // extensionality).
+            let op = if rng.coin() { "=" } else { "distinct" };
+            let a = gen_array_term(rng, arrays, idxvars, MAX_TERM_DEPTH_LOCAL);
+            let b = gen_array_term(rng, arrays, idxvars, MAX_TERM_DEPTH_LOCAL);
+            format!("({op} {a} {b})")
+        }
+        1 => {
+            // read-then-compare: (rel (select a i) j)
+            let op = ARITH_REL_OPS[rng.index(ARITH_REL_OPS.len())];
+            let a = gen_array_term(rng, arrays, idxvars, 1);
+            let i = gen_small_int_term(rng, idxvars);
+            let lhs = format!("(select {a} {i})");
+            let rhs = gen_small_int_term(rng, idxvars);
+            format!("({op} {lhs} {rhs})")
+        }
+        _ => {
+            // two reads compared: (rel (select a i) (select b j))
+            let op = ARITH_REL_OPS[rng.index(ARITH_REL_OPS.len())];
+            let a = gen_array_term(rng, arrays, idxvars, 1);
+            let b = gen_array_term(rng, arrays, idxvars, 1);
+            let i = gen_small_int_term(rng, idxvars);
+            let j = gen_small_int_term(rng, idxvars);
+            format!("({op} (select {a} {i}) (select {b} {j}))")
+        }
+    }
+}
+
+fn gen_array(rng: &mut Rng, cfg: &Config) -> (String, Vec<String>) {
+    let narr = rng.range_u32(2, 3) as usize;
+    let arrays: Vec<String> = (0..narr).map(|i| format!("a{i}")).collect();
+    let nidx = rng.range_u32(2, 3) as usize;
+    let idxvars: Vec<String> = (0..nidx).map(|i| format!("i{i}")).collect();
+    let num_asserts = rng.range_u32(cfg.min_asserts as u32, cfg.max_asserts as u32) as usize;
+
+    let mut out = String::new();
+    let _ = writeln!(out, "; grammar-fuzzer (QF_AUFLIA Array Int Int)");
+    let _ = writeln!(out, "(set-logic QF_AUFLIA)");
+    for a in &arrays {
+        let _ = writeln!(out, "(declare-const {a} (Array Int Int))");
+    }
+    for i in &idxvars {
+        let _ = writeln!(out, "(declare-const {i} Int)");
+    }
+    for _ in 0..num_asserts {
+        let formula = gen_bool(rng, cfg.max_formula_depth, &mut |r| {
+            gen_array_atom(r, &arrays, &idxvars)
+        });
+        let _ = writeln!(out, "(assert {formula})");
+    }
+    let _ = writeln!(out, "(check-sat)");
+    let _ = writeln!(out, "(exit)");
+    // Array models are stores -> excluded from the model oracle.
+    (out, Vec::new())
+}
+
+// =====================================================================
+// QF_S: strings
+// =====================================================================
+
+const STR_ALPHABET: &str = "ab";
+
+fn str_literal(rng: &mut Rng) -> String {
+    let len = rng.range_u32(0, 3) as usize;
+    let mut s = String::new();
+    for _ in 0..len {
+        s.push(STR_ALPHABET.as_bytes()[rng.index(STR_ALPHABET.len())] as char);
+    }
+    // Escape backslashes/quotes defensively (alphabet has none, but keep
+    // future-proof).
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn small_int_const(rng: &mut Rng) -> i64 {
+    rng.range_i64(0, 3)
+}
+
+/// A string-typed term.
+fn gen_str_term(rng: &mut Rng, vars: &[String], depth: u32) -> String {
+    if depth == 0 || rng.chance(1, 3) {
+        if !vars.is_empty() && rng.chance(1, 2) {
+            return vars[rng.index(vars.len())].clone();
+        }
+        return format!("\"{}\"", str_literal(rng));
+    }
+    match rng.index(5) {
+        0 => {
+            let a = gen_str_term(rng, vars, depth - 1);
+            let b = gen_str_term(rng, vars, depth - 1);
+            format!("(str.++ {a} {b})")
+        }
+        1 => {
+            let a = gen_str_term(rng, vars, depth - 1);
+            let i = small_int_const(rng);
+            format!("(str.at {a} {i})")
+        }
+        2 => {
+            let a = gen_str_term(rng, vars, depth - 1);
+            let i = small_int_const(rng);
+            let j = small_int_const(rng).max(1);
+            format!("(str.substr {a} {i} {j})")
+        }
+        3 => {
+            let a = gen_str_term(rng, vars, depth - 1);
+            let b = format!("\"{}\"", str_literal(rng));
+            let c = format!("\"{}\"", str_literal(rng));
+            format!("(str.replace {a} {b} {c})")
+        }
+        _ => format!("\"{}\"", str_literal(rng)),
+    }
+}
+
+fn gen_str_atom(rng: &mut Rng, vars: &[String]) -> String {
+    match rng.index(6) {
+        0 => {
+            let op = if rng.coin() { "=" } else { "distinct" };
+            let a = gen_str_term(rng, vars, MAX_TERM_DEPTH_LOCAL);
+            let b = gen_str_term(rng, vars, MAX_TERM_DEPTH_LOCAL);
+            format!("({op} {a} {b})")
+        }
+        1 => {
+            let a = gen_str_term(rng, vars, MAX_TERM_DEPTH_LOCAL);
+            let b = gen_str_term(rng, vars, MAX_TERM_DEPTH_LOCAL);
+            format!("(str.contains {a} {b})")
+        }
+        2 => {
+            let a = gen_str_term(rng, vars, MAX_TERM_DEPTH_LOCAL);
+            let b = gen_str_term(rng, vars, MAX_TERM_DEPTH_LOCAL);
+            format!("(str.prefixof {a} {b})")
+        }
+        3 => {
+            let a = gen_str_term(rng, vars, MAX_TERM_DEPTH_LOCAL);
+            let b = gen_str_term(rng, vars, MAX_TERM_DEPTH_LOCAL);
+            format!("(str.suffixof {a} {b})")
+        }
+        4 => {
+            // (str.len s) compared to a small int.
+            let op = ARITH_REL_OPS[rng.index(ARITH_REL_OPS.len())];
+            let a = gen_str_term(rng, vars, MAX_TERM_DEPTH_LOCAL);
+            let n = small_int_const(rng);
+            format!("({op} (str.len {a}) {n})")
+        }
+        _ => {
+            // str.indexof compared to a small int.
+            let op = ARITH_REL_OPS[rng.index(ARITH_REL_OPS.len())];
+            let a = gen_str_term(rng, vars, MAX_TERM_DEPTH_LOCAL);
+            let b = gen_str_term(rng, vars, MAX_TERM_DEPTH_LOCAL);
+            let n = small_int_const(rng);
+            format!("({op} (str.indexof {a} {b} 0) {n})")
+        }
+    }
+}
+
+fn gen_string(rng: &mut Rng, cfg: &Config) -> (String, Vec<String>) {
+    let num_vars = rng.range_u32(cfg.min_vars as u32, cfg.max_vars as u32) as usize;
+    let vars: Vec<String> = (0..num_vars).map(|i| format!("s{i}")).collect();
+    let num_asserts = rng.range_u32(cfg.min_asserts as u32, cfg.max_asserts as u32) as usize;
+
+    let mut out = String::new();
+    let _ = writeln!(out, "; grammar-fuzzer (QF_S)");
+    let _ = writeln!(out, "(set-logic QF_S)");
+    for v in &vars {
+        let _ = writeln!(out, "(declare-const {v} String)");
+    }
+    for _ in 0..num_asserts {
+        let formula = gen_bool(rng, cfg.max_formula_depth, &mut |r| gen_str_atom(r, &vars));
+        let _ = writeln!(out, "(assert {formula})");
+    }
+    let _ = writeln!(out, "(check-sat)");
+    let _ = writeln!(out, "(exit)");
+    (out, vars)
+}
+
+// Local shorthand so atom builders don't each need `cfg` threaded through.
+const MAX_TERM_DEPTH_LOCAL: u32 = 2;
 
 // =====================================================================
 // Tests
@@ -559,9 +771,10 @@ mod tests {
     #[test]
     fn deterministic_for_fixed_seed() {
         for logic in Logic::ALL {
-            let a = generate(logic, 12345, &Config::default()).source;
-            let b = generate(logic, 12345, &Config::default()).source;
-            assert_eq!(a, b, "{logic} must be deterministic for a fixed seed");
+            let a = generate(logic, 12345, &Config::default());
+            let b = generate(logic, 12345, &Config::default());
+            assert_eq!(a.source, b.source, "{logic} must be deterministic");
+            assert_eq!(a.vars, b.vars, "{logic} vars must be deterministic");
         }
     }
 
@@ -584,7 +797,7 @@ mod tests {
                     "{logic} seed {seed} missing set-logic"
                 );
                 assert!(
-                    s.trim_end().ends_with("(exit)") || s.contains("(check-sat)"),
+                    s.contains("(check-sat)"),
                     "{logic} seed {seed} missing check-sat"
                 );
                 let opens = s.chars().filter(|&c| c == '(').count();
@@ -595,9 +808,9 @@ mod tests {
     }
 
     #[test]
-    fn lia_terms_never_multiply_two_variables() {
-        // Regression guard: the first arg of every `(* ...)` must be a
-        // numeral/`(- numeral)`, never `x<N>`.
+    fn qf_lia_terms_never_multiply_two_variables() {
+        // QF_LIA must stay linear: the first arg of `(* ...)` is always a
+        // numeral, never `x<N>`.
         for seed in 0..80u64 {
             let s = generate(Logic::QfLia, seed, &Config::default()).source;
             for line in s.lines() {
@@ -610,14 +823,45 @@ mod tests {
     }
 
     #[test]
+    fn qf_nia_does_reach_nonlinear_products() {
+        // Sanity that the nonlinear fragment is actually nonlinear across a
+        // reasonable seed range.
+        let mut seen_nonlinear = 0;
+        for seed in 0..200u64 {
+            let s = generate(Logic::QfNia, seed, &Config::default()).source;
+            if s.contains("(* x") {
+                seen_nonlinear += 1;
+            }
+        }
+        assert!(
+            seen_nonlinear > 50,
+            "QF_NIA rarely produced var*var ({seen_nonlinear}/200)"
+        );
+    }
+
+    #[test]
+    fn qf_lra_never_uses_int_only_ops() {
+        for seed in 0..80u64 {
+            let s = generate(Logic::QfLra, seed, &Config::default()).source;
+            for line in s.lines() {
+                for bad in ["(div ", "(mod ", "(abs "] {
+                    assert!(
+                        !line.contains(bad),
+                        "seed {seed}: Int-only op `{}` in Real script: {line}",
+                        bad.trim()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn bv_divisor_is_never_zero() {
-        // Every division-like op's second argument must contain a `1` bit.
         for seed in 0..80u64 {
             let s = generate(Logic::QfBv, seed, &Config::default()).source;
             for line in s.lines() {
                 for op in BV_DIVOPS.iter().copied() {
                     if let Some(rest) = line.strip_prefix(&format!("({op} ")) {
-                        // rest looks like "<a> <const>)"
                         if let Some(divisor) = rest.split_whitespace().nth(1) {
                             let divisor = divisor.trim_end_matches(')');
                             assert!(
@@ -632,30 +876,23 @@ mod tests {
     }
 
     #[test]
-    fn parse_list_roundtrips() {
-        assert_eq!(
-            Logic::parse_list("QF_LIA, qf_bv ,LIA"),
-            Some(vec![Logic::QfLia, Logic::QfBv, Logic::Lia])
-        );
-        assert_eq!(Logic::parse_list("nonsense"), None);
-        assert_eq!(Logic::parse_list(""), None);
+    fn array_scripts_only_index_with_int_terms() {
+        // Cheap structural guard: no Real/Bool leakage into QF_A.
+        for seed in 0..40u64 {
+            let s = generate(Logic::QfA, seed, &Config::default()).source;
+            assert!(s.contains("(declare-const a0 (Array Int Int))"));
+            assert!(s.contains("(set-logic QF_AUFLIA)"));
+            assert!(!s.contains("Real"));
+        }
     }
 
     #[test]
-    fn qf_lra_never_uses_int_only_ops() {
-        // `div`/`mod`/`abs` are Int-only in SMT-LIB; emitting them over Real
-        // is a generator bug that z3 rejects as a sort error.
-        for seed in 0..80u64 {
-            let s = generate(Logic::QfLra, seed, &Config::default()).source;
-            for line in s.lines() {
-                for bad in ["(div ", "(mod ", "(abs "] {
-                    assert!(
-                        !line.contains(bad),
-                        "seed {seed}: Int-only op `{}` in Real script: {line}",
-                        bad.trim()
-                    );
-                }
-            }
-        }
+    fn parse_list_roundtrips() {
+        assert_eq!(
+            Logic::parse_list("QF_LIA, qf_nia ,QF_S,QF_A"),
+            Some(vec![Logic::QfLia, Logic::QfNia, Logic::QfS, Logic::QfA])
+        );
+        assert_eq!(Logic::parse_list("nonsense"), None);
+        assert_eq!(Logic::parse_list(""), None);
     }
 }

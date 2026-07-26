@@ -19,22 +19,35 @@ drifts).
 
 ## The oracle
 
-| z3 | oxiz | classification |
-|----|------|----------------|
-| sat | sat / unsat / unsat / sat | **`Agree`** / **`SoundnessDisagree`** (headline bug) |
-| sat/unsat | error | **`OneError`** (potential parser/crash bug) |
-| unknown (either side) | * | `Inconclusive` (honest, not a bug) |
-| timeout (either side) | * | `Timeout` (not a bug) |
-| error | error | `BothError` (malformed input; shouldn't happen) |
+For each case the harness classifies:
 
-A `SoundnessDisagree` (one solver says `sat`, the other `unsat`) is the only
-thing that fails the run (exit code 1).
+| situation | classification |
+|-----------|----------------|
+| z3 and oxiz give opposite definite sat/unsat | **`SoundnessDisagree`** (headline bug) |
+| both say sat, but oxiz's grounded model fails a z3 re-check (or is malformed) | **`InvalidModel`** |
+| one answers sat/unsat, the other errors/crashes | **`OneError`** |
+| both agree (sat/sat or unsat/unsat), model valid where checked | `Agree` |
+| `unknown` on either side (no sat/unsat disagree) | `Inconclusive` |
+| either side times out | `Timeout` |
+| both error | `BothError` (shouldn't happen) |
+
+A `SoundnessDisagree`, `InvalidModel`, or `OneError` fails the run (exit 1).
+
+**Model-validity oracle.** When oxiz reports `sat` over a logic whose models
+are concrete scalar values (QF_LIA/LRA/NIA/NRA/BV/S), the harness re-runs oxiz
+with `(get-value ...)`, grounds the original assertions against that
+assignment, and asks z3 whether the conjunction still holds. A model z3 calls
+unsatisfiable — or can't even parse (e.g. an oxiz bug once produced the
+malformed token `#x-1`) — is flagged as an `InvalidModel` discrepancy, catching
+"right verdict, bogus witness" bugs that plain parity would miss.
 
 ## Logics
 
-`QF_LIA`, `QF_LRA`, `QF_BV`, `QF_UF`, and quantified `LIA` (`forall`/`exists`).
-Arithmetic is kept linear (constant·variable only); `div`/`mod` only ever take a
-non-zero numeral divisor; bit-vector scripts use a single fixed width; division
+`QF_LIA`, `QF_LRA`, `QF_NIA`, `QF_NRA` (nonlinear), `QF_BV`, `QF_UF`,
+`QF_AUFLIA` (arrays `Int→Int`), `QF_S` (strings), and quantified `LIA`
+(`forall`/`exists`). Arithmetic is kept inside its fragment (linear for
+LIA/LRA, var·var only in NIA/NRA); `div`/`mod` only ever take a non-zero
+numeral divisor; bit-vector scripts use a single fixed width; division
 semantics noise (divide-by-zero, Int-vs-Real `div`/`/`) is avoided by
 construction. See [`src/grammar.rs`](src/grammar.rs).
 
@@ -58,7 +71,7 @@ The fuzzer auto-detects `target/release/oxiz`; `z3` must be on `PATH`.
 
 ```
 --iterations N     Cases per logic        [default: 1000]
---logics LIST      Comma-separated        [default: QF_LIA,QF_LRA,QF_BV,QF_UF,LIA]
+--logics LIST      Comma-separated        [default: QF_LIA,QF_LRA,QF_NIA,QF_NRA,QF_BV,QF_UF,QF_AUFLIA,QF_S,LIA]
 --base-seed N      Starting seed          [default: 0]
 --timeout SECS     Per-case budget        [default: 10]
 --oxiz PATH        oxiz binary            [default: target/release/oxiz, then PATH]

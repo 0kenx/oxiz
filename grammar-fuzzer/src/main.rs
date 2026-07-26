@@ -245,10 +245,14 @@ fn main() -> ExitCode {
                 // loses it.
                 let p = disc_dir.join(format!("seed-{}-{seed}.smt2", logic.name()));
                 let header = format!(
-                    "; DISCREPANCY  logic={logic}  seed={seed}\n\
+                    "; DISCREPANCY  logic={logic}  seed={seed}  outcome={:?}\n\
                      ; z3={}  oxiz={}\n\
                      ; z3-out={:?}  oxiz-out={:?}\n",
-                    case.z3.verdict, case.oxiz.verdict, case.z3.first_line, case.oxiz.first_line
+                    case.outcome(),
+                    case.z3.verdict,
+                    case.oxiz.verdict,
+                    case.z3.first_line,
+                    case.oxiz.first_line
                 );
                 let _ = std::fs::write(&p, format!("{header}{}", script.source));
                 cases.push(case);
@@ -278,6 +282,10 @@ fn main() -> ExitCode {
         .iter()
         .filter(|c| matches!(c.outcome(), harness::Outcome::SoundnessDisagree))
         .count();
+    let invalid_models = cases
+        .iter()
+        .filter(|c| matches!(c.outcome(), harness::Outcome::InvalidModel))
+        .count();
 
     eprintln!("report written to {}", report_path.display());
     if !cases.is_empty() {
@@ -288,8 +296,10 @@ fn main() -> ExitCode {
         );
     }
 
-    if soundness > 0 {
-        eprintln!("FAIL: {soundness} soundness (sat/unsat) discrepancies found");
+    if soundness > 0 || invalid_models > 0 {
+        eprintln!(
+            "FAIL: {soundness} soundness + {invalid_models} invalid-model discrepancies found"
+        );
         ExitCode::from(1)
     } else {
         ExitCode::from(0)
