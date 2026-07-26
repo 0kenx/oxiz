@@ -31,6 +31,23 @@ impl Solver {
         var
     }
 
+    /// Pin a BV variable's dual ArithSolver image to the unsigned domain
+    /// `[0, 2^w − 1]`.  Widths above 63 skip the upper bound (doesn't fit
+    /// `i64`); the lower bound `x ≥ 0` is always asserted.
+    fn ensure_bv_arith_domain(&mut self, term: TermId, width: u32) {
+        // Reason term is the BV var itself — these are structural domain axioms,
+        // not user assertions; cores that surface them are still sound supersets.
+        let reason = term;
+        let one = [(term, Rational64::one())];
+        self.arith
+            .assert_ge(&one, Rational64::zero(), reason);
+        if width > 0 && width <= 63 {
+            let max = (1i64 << width) - 1;
+            self.arith
+                .assert_le(&one, Rational64::from_integer(max), reason);
+        }
+    }
+
     /// Track theory variables in a term for model extraction.
     /// Recursively scans a term to find Int/Real/BV variables and registers them.
     ///
@@ -62,10 +79,15 @@ impl Solver {
                     self.trail.push(TrailOp::BvTermAdded { term: term_id });
                     if let Some(width) = sort.bitvec_width() {
                         self.bv.new_bv(term_id, width);
+                        // Also intern in ArithSolver for BV comparison constraints
+                        // (BV comparisons are handled as bounded integer arithmetic)
+                        self.arith.intern(term_id);
+                        // Unsigned domain 0 ≤ x ≤ 2^w−1 so dual arith encoding of
+                        // `(bvult x #b0)` is unsat rather than sat at x = −1.
+                        self.ensure_bv_arith_domain(term_id, width);
+                    } else {
+                        self.arith.intern(term_id);
                     }
-                    // Also intern in ArithSolver for BV comparison constraints
-                    // (BV comparisons are handled as bounded integer arithmetic)
-                    self.arith.intern(term_id);
                 }
             }
             // Recursively scan compound terms.

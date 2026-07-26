@@ -1106,16 +1106,12 @@ impl<'a> TheoryManager<'a> {
 
                 // Handle BV comparisons
                 if lhs_is_bv || rhs_is_bv {
-                    // Get BV width
-                    let width = manager
-                        .get(lhs)
-                        .and_then(|t| manager.sorts.get(t.sort).and_then(|s| s.bitvec_width()));
-
-                    if let Some(width) = width {
-                        // Ensure both operands have BV variables
-                        self.bv.new_bv(lhs, width);
-                        self.bv.new_bv(rhs, width);
-
+                    // Bit-blast both operands *with constants pinned*.  Bare
+                    // `new_bv` leaves `BitVecConst` bits unconstrained, so
+                    // `(bvult x #b0)` was treated as `x < free` and reported
+                    // sat (issue #17).  `bit_blast_bv_pair` routes through
+                    // `encode_bv_term_recursive`, which calls `assert_const`.
+                    if self.bit_blast_bv_pair(lhs, rhs, manager) {
                         // Derive signedness from the original TermKind stored for
                         // the SAT variable.  Both BvSlt and BvUlt encode to
                         // Constraint::Lt(lhs, rhs) during formula encoding (encode.rs),

@@ -2,12 +2,29 @@
 
 #[allow(unused_imports)]
 use crate::prelude::*;
-use num_traits::ToPrimitive;
+use num_bigint::BigInt;
+use num_traits::{Signed, ToPrimitive, Zero};
 use oxiz_core::ast::{TermId, TermKind, TermManager};
 
 use super::Solver;
 use super::types::Constraint;
 use super::types::{Model, UnsatCore};
+
+/// Reduce an integer to the canonical unsigned representative in `[0, 2^w)`.
+///
+/// Defends model output against a stale arith assignment outside the BV domain
+/// (historically `x = -1` → malformed `#x-1`).
+fn bv_model_u_bits(value: impl Into<BigInt>, width: u32) -> BigInt {
+    if width == 0 {
+        return BigInt::zero();
+    }
+    let modulus = BigInt::from(1) << width as usize;
+    let mut v = value.into() % &modulus;
+    if v.is_negative() {
+        v += &modulus;
+    }
+    v
+}
 
 impl Solver {
     pub(super) fn build_model(&mut self, manager: &mut TermManager) {
@@ -180,7 +197,7 @@ impl Solver {
                 if let Some(bv_value) = bv_value {
                     manager.mk_bitvec(bv_value, width)
                 } else if let Some(arith_value) = arith_value {
-                    manager.mk_bitvec(arith_value.to_integer(), width)
+                    manager.mk_bitvec(bv_model_u_bits(arith_value.to_integer(), width), width)
                 } else {
                     manager.mk_bitvec(0i64, width)
                 }
@@ -189,7 +206,7 @@ impl Solver {
                 // bounds, so prefer its value; only fall back to the (unpinned)
                 // BV bits or a default when arith has nothing.
                 if let Some(arith_value) = arith_value {
-                    manager.mk_bitvec(arith_value.to_integer(), width)
+                    manager.mk_bitvec(bv_model_u_bits(arith_value.to_integer(), width), width)
                 } else if let Some(bv_value) = bv_value {
                     manager.mk_bitvec(bv_value, width)
                 } else {
