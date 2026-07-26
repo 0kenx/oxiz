@@ -532,7 +532,8 @@ impl Model {
             | TermKind::False
             | TermKind::IntConst(_)
             | TermKind::RealConst(_)
-            | TermKind::BitVecConst { .. } => term,
+            | TermKind::BitVecConst { .. }
+            | TermKind::StringLit(_) => term,
 
             // Variables: look up in model or return the variable itself
             TermKind::Var(_) => self.get(term).unwrap_or(term),

@@ -344,6 +344,7 @@ impl Context {
             return "?".to_string();
         };
         match &s.kind {
+            SortKind::String => "\"\"".to_string(),
             SortKind::BitVec(w) => format!("#b{:0>width$}", "0", width = *w as usize),
             // Positive zero is a canonical, valid ground FP value.
             SortKind::FloatingPoint { eb, sb } => format!("(_ +zero {eb} {sb})"),

@@ -107,6 +107,10 @@ pub(crate) struct TheoryManager<'a> {
     /// between same-width constants, bounding the edge count by the number of
     /// distinct BV literals in the formula.
     interned_bv_constants: FxHashMap<(u64, u32), u32>,
+    /// Canonical EUF nodes for distinct string literals.  EUF has no built-in
+    /// notion that `"x" ≠ "y"`, so without explicit diseqs `s="x" ∧ s="y"` is
+    /// spuriously sat (issue #14).
+    interned_string_constants: FxHashMap<String, u32>,
     /// Canonical EUF nodes for Boolean true and false values.
     /// Used to track Bool-valued function applications in EUF:
     /// when `f(x)` is assigned true by the SAT solver, we merge its EUF node
@@ -203,6 +207,7 @@ impl<'a> TheoryManager<'a> {
             has_bv_arith_ops,
             interned_int_constants: FxHashMap::default(),
             interned_bv_constants: FxHashMap::default(),
+            interned_string_constants: FxHashMap::default(),
             bool_true_node: None,
             bool_false_node: None,
             resource_exhausted: false,
@@ -267,6 +272,7 @@ impl<'a> TheoryManager<'a> {
         self.bv.reset();
         self.interned_int_constants.clear();
         self.interned_bv_constants.clear();
+        self.interned_string_constants.clear();
         self.bool_true_node = None;
         self.bool_false_node = None;
         self.processed_equalities.clear();
@@ -632,6 +638,22 @@ impl<'a> TheoryManager<'a> {
                         self.euf.assert_diseq(new_node, other_node, term);
                     }
                     self.interned_bv_constants.insert(key, new_node);
+                    return new_node;
+                }
+                TermKind::StringLit(s) => {
+                    // Pairwise diseqs between distinct string literals so
+                    // `s = "x" ∧ s = "y"` is unsat in EUF (issue #14).
+                    let new_node = self.euf.intern(term);
+                    if let Some(&canonical) = self.interned_string_constants.get(s) {
+                        let _ = self.euf.merge(new_node, canonical, term);
+                        return canonical;
+                    }
+                    let diseq_targets: Vec<u32> =
+                        self.interned_string_constants.values().copied().collect();
+                    for other_node in diseq_targets {
+                        self.euf.assert_diseq(new_node, other_node, term);
+                    }
+                    self.interned_string_constants.insert(s.clone(), new_node);
                     return new_node;
                 }
                 _ => {}
@@ -1586,6 +1608,8 @@ impl TheoryCallback for TheoryManager<'_> {
 
         // Evict stale bit-vector-constant canonicals for the same reason.
         self.interned_bv_constants
+            .retain(|_key, &mut canonical| (canonical as usize) < live_nodes);
+        self.interned_string_constants
             .retain(|_key, &mut canonical| (canonical as usize) < live_nodes);
 
         // Evict stale Boolean canonical nodes

@@ -42,10 +42,11 @@ use oxiz_core::ast::{TermId, TermKind, TermManager};
 /// formulas is handled by the definite-conflict detectors in `oxiz-solver`.
 /// This procedure only ever *confirms* satisfiability with a concrete witness
 /// (`Sat`) or gives up (`Unknown`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroundStringOutcome {
     /// A concrete model was constructed and verified against every assertion.
-    Sat,
+    /// The map assigns every free string variable a concrete value.
+    Sat(FxHashMap<TermId, String>),
     /// No verified model could be built within the search bounds.
     Unknown,
 }
@@ -67,7 +68,7 @@ pub fn solve_ground_string(manager: &TermManager, assertions: &[TermId]) -> Grou
     let mut builder = ModelBuilder::new(manager, assertions);
     builder.gather();
     if builder.build_assignment() && builder.verify() {
-        return GroundStringOutcome::Sat;
+        return GroundStringOutcome::Sat(builder.model);
     }
     GroundStringOutcome::Unknown
 }
@@ -1026,7 +1027,7 @@ mod tests {
                (assert (= x "hel"))
                (assert (= y "lo"))"#,
         );
-        assert_eq!(out, GroundStringOutcome::Sat);
+        assert!(matches!(out, GroundStringOutcome::Sat(_)));
     }
 
     #[test]
@@ -1038,7 +1039,7 @@ mod tests {
                (assert (= (str.len t) 3))
                (assert (= (str.++ s t) "worldfoo"))"#,
         );
-        assert_eq!(out, GroundStringOutcome::Sat);
+        assert!(matches!(out, GroundStringOutcome::Sat(_)));
     }
 
     #[test]
@@ -1049,7 +1050,7 @@ mod tests {
                (assert (str.prefixof "my" s))
                (assert (>= (str.len s) 6))"#,
         );
-        assert_eq!(out, GroundStringOutcome::Sat);
+        assert!(matches!(out, GroundStringOutcome::Sat(_)));
     }
 
     #[test]
@@ -1060,7 +1061,7 @@ mod tests {
                (assert (str.contains text "file"))
                (assert (<= (str.len text) 15))"#,
         );
-        assert_eq!(out, GroundStringOutcome::Sat);
+        assert!(matches!(out, GroundStringOutcome::Sat(_)));
     }
 
     #[test]
@@ -1072,7 +1073,7 @@ mod tests {
                (assert (= input "the old way"))
                (assert (= output "the new way"))"#,
         );
-        assert_eq!(out, GroundStringOutcome::Sat);
+        assert!(matches!(out, GroundStringOutcome::Sat(_)));
     }
 
     #[test]
@@ -1083,7 +1084,7 @@ mod tests {
                (assert (= (str.len phone) 10))
                (assert (str.prefixof "call" phone))"#,
         );
-        assert_eq!(out, GroundStringOutcome::Sat);
+        assert!(matches!(out, GroundStringOutcome::Sat(_)));
     }
 
     #[test]
@@ -1095,7 +1096,7 @@ mod tests {
                (assert (<= (str.len word) 8))
                (assert (str.contains word "test"))"#,
         );
-        assert_eq!(out, GroundStringOutcome::Sat);
+        assert!(matches!(out, GroundStringOutcome::Sat(_)));
     }
 
     #[test]
@@ -1118,7 +1119,7 @@ mod tests {
                (assert (= r (str.replace "abc" "" "X")))
                (assert (= r "Xabc"))"#,
         );
-        assert_eq!(out, GroundStringOutcome::Sat);
+        assert!(matches!(out, GroundStringOutcome::Sat(_)));
         // The wrong reading (unchanged) must NOT verify.
         let bad = solve(
             r#"(declare-const r String)
@@ -1132,7 +1133,7 @@ mod tests {
                (assert (= r (str.replace_all "abc" "" "X")))
                (assert (= r "abc"))"#,
         );
-        assert_eq!(all, GroundStringOutcome::Sat);
+        assert!(matches!(all, GroundStringOutcome::Sat(_)));
     }
 
     #[test]
@@ -1156,6 +1157,6 @@ mod tests {
                (assert (not (str.in_re w (str.to_re "cat"))))
                (assert (str.in_re w (re.++ (re.range "a" "z") (re.++ (re.range "a" "z") (re.range "a" "z")))))"#,
         );
-        assert_eq!(out, GroundStringOutcome::Sat);
+        assert!(matches!(out, GroundStringOutcome::Sat(_)));
     }
 }
