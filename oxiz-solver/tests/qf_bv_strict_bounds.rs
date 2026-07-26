@@ -108,3 +108,46 @@ fn bvult_x_zero_widths() {
         assert_eq!(r, SolverResult::Unsat, "width={w} outputs={out:?}");
     }
 }
+
+/// Issue #17 follow-up: compound LHS must also hit the BV path.
+#[test]
+fn bvslt_bvadd_smin_is_unsat() {
+    let (r, out) = run(
+        r#"
+        (set-logic QF_BV)
+        (declare-const x1 (_ BitVec 8))
+        (declare-const x3 (_ BitVec 8))
+        (assert (bvslt (bvadd x1 x3) #b10000000))
+        (check-sat)
+        "#,
+    );
+    assert_eq!(r, SolverResult::Unsat, "outputs={out:?}");
+}
+
+#[test]
+fn bvslt_bvand_bvudiv_smin_is_unsat() {
+    let (r, out) = run(
+        r#"
+        (set-logic QF_BV)
+        (declare-const x1 (_ BitVec 8))
+        (declare-const x3 (_ BitVec 8))
+        (assert (bvslt (bvand (bvudiv x1 #b11110110) x3) #b10000000))
+        (check-sat)
+        "#,
+    );
+    assert_eq!(r, SolverResult::Unsat, "outputs={out:?}");
+}
+
+#[test]
+fn bvult_bvadd_zero_is_unsat() {
+    let (r, out) = run(
+        r#"
+        (set-logic QF_BV)
+        (declare-const x (_ BitVec 8))
+        (declare-const y (_ BitVec 8))
+        (assert (bvult (bvadd x y) #b00000000))
+        (check-sat)
+        "#,
+    );
+    assert_eq!(r, SolverResult::Unsat, "outputs={out:?}");
+}

@@ -1100,17 +1100,18 @@ impl<'a> TheoryManager<'a> {
                 self.intern_term_for_congruence(lhs, manager);
                 self.intern_term_for_congruence(rhs, manager);
 
-                // Check if this is a BV comparison
-                let lhs_is_bv = self.bv_terms.contains(&lhs);
-                let rhs_is_bv = self.bv_terms.contains(&rhs);
+                // BV comparisons by *sort*, not `bv_terms` membership.
+                // `bv_terms` only tracks free BV *variables*; compound operands
+                // like `(bvadd x y)` are absent, so gating on `bv_terms` skipped
+                // the BV path entirely and left `(bvslt (bvadd x y) smin)` as a
+                // free Boolean → spurious sat (issue #17 follow-up).
+                let lhs_is_bv = self.bv_width_of(lhs, manager).is_some();
+                let rhs_is_bv = self.bv_width_of(rhs, manager).is_some();
 
                 // Handle BV comparisons
                 if lhs_is_bv || rhs_is_bv {
-                    // Bit-blast both operands *with constants pinned*.  Bare
-                    // `new_bv` leaves `BitVecConst` bits unconstrained, so
-                    // `(bvult x #b0)` was treated as `x < free` and reported
-                    // sat (issue #17).  `bit_blast_bv_pair` routes through
-                    // `encode_bv_term_recursive`, which calls `assert_const`.
+                    // Bit-blast both operands *with constants pinned* and
+                    // compounds fully encoded via `encode_bv_term_recursive`.
                     if self.bit_blast_bv_pair(lhs, rhs, manager) {
                         // Derive signedness from the original TermKind stored for
                         // the SAT variable.  Both BvSlt and BvUlt encode to
