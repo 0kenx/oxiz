@@ -1558,8 +1558,11 @@ impl Solver {
     /// This ensures the ArithSolver knows about the disequality and doesn't
     /// assign both a and b to equal values.
     pub(super) fn add_arith_diseq_split(&mut self, term: TermId, manager: &mut TermManager) {
-        let mut visited = FxHashSet::default();
-        self.add_arith_diseq_split_recursive(term, manager, &mut visited);
+        // Visit keys are (term_raw, polarity) so the same subterm under both
+        // polarities is walked correctly.
+        let mut visited: FxHashSet<(u32, bool)> = FxHashSet::default();
+        // Start under positive polarity: the assertion itself is assumed true.
+        self.add_arith_diseq_split_recursive(term, manager, &mut visited, true);
     }
 
     /// Add trichotomy clauses `Eq(a,b) OR Lt(a,b) OR Gt(a,b)` for every
@@ -1654,13 +1657,19 @@ impl Solver {
     /// This handles MBQI instantiation results that are implications like
     /// `(=> guard (not (= a b)))` where the disequality is nested inside
     /// the formula rather than at the top level.
+    /// Walk `term` under Boolean polarity `pos` (true = term occurs asserted).
+    ///
+    /// Only **positive** occurrences of arithmetic disequalities contribute
+    /// `Lt ∨ Gt` splits.  A negative Distinct (i.e. `(not (distinct …))`) means
+    /// some pair is equal — adding splits there forced unsat (issue #22).
     fn add_arith_diseq_split_recursive(
         &mut self,
         term: TermId,
         manager: &mut TermManager,
-        visited: &mut FxHashSet<TermId>,
+        visited: &mut FxHashSet<(u32, bool)>,
+        pos: bool,
     ) {
-        if !visited.insert(term) {
+        if !visited.insert((term.raw(), pos)) {
             return;
         }
 
@@ -1671,49 +1680,69 @@ impl Solver {
         match &t.kind {
             TermKind::Not(inner) => {
                 let inner_id = *inner;
-                if let Some(inner_t) = manager.get(inner_id).cloned() {
-                    if let TermKind::Eq(lhs, rhs) = &inner_t.kind {
-                        let lhs_is_numeric = manager.get(*lhs).is_some_and(|lt| {
-                            lt.sort == manager.sorts.int_sort || lt.sort == manager.sorts.real_sort
-                        });
-                        if lhs_is_numeric {
-                            let (l, r) = (*lhs, *rhs);
-                            // Build Lt(lhs, rhs) and Gt(lhs, rhs)
-                            let lt_term = manager.mk_lt(l, r);
-                            let gt_term = manager.mk_gt(l, r);
-
-                            // Encode both and add the disjunction
-                            let lt_lit = self.encode(lt_term, manager);
-                            let gt_lit = self.encode(gt_term, manager);
-                            self.sat.add_clause([lt_lit, gt_lit]);
+                // Positive Not(Eq(a,b)) is an asserted arithmetic disequality.
+                if pos {
+                    if let Some(inner_t) = manager.get(inner_id).cloned() {
+                        if let TermKind::Eq(lhs, rhs) = &inner_t.kind {
+                            let lhs_is_numeric = manager.get(*lhs).is_some_and(|lt| {
+                                lt.sort == manager.sorts.int_sort
+                                    || lt.sort == manager.sorts.real_sort
+                            });
+                            if lhs_is_numeric {
+                                let (l, r) = (*lhs, *rhs);
+                                let lt_term = manager.mk_lt(l, r);
+                                let gt_term = manager.mk_gt(l, r);
+                                let lt_lit = self.encode(lt_term, manager);
+                                let gt_lit = self.encode(gt_term, manager);
+                                self.sat.add_clause([lt_lit, gt_lit]);
+                            }
                         }
                     }
                 }
-                // Also recurse into the inner term
-                self.add_arith_diseq_split_recursive(inner_id, manager, visited);
+                self.add_arith_diseq_split_recursive(inner_id, manager, visited, !pos);
             }
             TermKind::And(args) => {
                 let args_clone: Vec<TermId> = args.iter().copied().collect();
                 for arg in args_clone {
-                    self.add_arith_diseq_split_recursive(arg, manager, visited);
+                    self.add_arith_diseq_split_recursive(arg, manager, visited, pos);
                 }
             }
             TermKind::Or(args) => {
                 let args_clone: Vec<TermId> = args.iter().copied().collect();
                 for arg in args_clone {
-                    self.add_arith_diseq_split_recursive(arg, manager, visited);
+                    self.add_arith_diseq_split_recursive(arg, manager, visited, pos);
                 }
             }
             TermKind::Implies(_, rhs) => {
-                // Recurse into the consequent -- that's where the disequality
-                // typically lives in quantifier instantiation lemmas
+                // Consequent under the same polarity as the implication when the
+                // implication is asserted (antecedent may be false — over-approx).
                 let rhs_id = *rhs;
-                self.add_arith_diseq_split_recursive(rhs_id, manager, visited);
+                self.add_arith_diseq_split_recursive(rhs_id, manager, visited, pos);
             }
             TermKind::Ite(_, then_br, else_br) => {
                 let (t, e) = (*then_br, *else_br);
-                self.add_arith_diseq_split_recursive(t, manager, visited);
-                self.add_arith_diseq_split_recursive(e, manager, visited);
+                self.add_arith_diseq_split_recursive(t, manager, visited, pos);
+                self.add_arith_diseq_split_recursive(e, manager, visited, pos);
+            }
+            TermKind::Distinct(args) if pos => {
+                // Positive Distinct: each numeric pair is disequal → Lt ∨ Gt.
+                // Negative Distinct (`not (distinct …)`) must NOT add splits:
+                // it asserts that some pair is equal (issue #22 / PR #13 bug).
+                for (i, &lhs) in args.iter().enumerate() {
+                    let lhs_is_numeric = manager.get(lhs).is_some_and(|lt| {
+                        lt.sort == manager.sorts.int_sort || lt.sort == manager.sorts.real_sort
+                    });
+                    if !lhs_is_numeric {
+                        continue;
+                    }
+                    for &rhs in args[i + 1..].iter() {
+                        let lt_term = manager.mk_lt(lhs, rhs);
+                        let gt_term = manager.mk_gt(lhs, rhs);
+                        let lt_lit = self.encode(lt_term, manager);
+                        let gt_lit = self.encode(gt_term, manager);
+                        self.sat.add_clause([lt_lit, gt_lit]);
+                    }
+                }
             }
             _ => {}
         }
