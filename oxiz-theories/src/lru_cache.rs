@@ -89,7 +89,6 @@ where
     }
 
     /// Get a value from the cache (also updates LRU order and hit/miss stats)
-    #[cfg(test)]
     pub fn get(&mut self, key: &K) -> Option<&V> {
         if let Some(&idx) = self.map.get(key) {
             self.hits += 1;
