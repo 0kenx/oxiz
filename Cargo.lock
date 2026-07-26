@@ -1779,6 +1779,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxiz-grammar-fuzzer"
+version = "0.1.0"
+
+[[package]]
 name = "oxiz-math"
 version = "0.3.0"
 dependencies = [

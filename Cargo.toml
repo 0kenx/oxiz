@@ -18,6 +18,10 @@ members = [
     "oxiz-ml",
     "bench/regression",
     "bench/profile",
+    # Dev-only grammar-driven differential fuzzer (z3 vs oxiz). Shells out to
+    # both solvers as subprocesses, so it has no dependency on any oxiz crate
+    # and is intentionally absent from `default-members`.
+    "grammar-fuzzer",
 ]
 
 # Exclude oxiz-py from default build since it requires maturin for proper Python linking.

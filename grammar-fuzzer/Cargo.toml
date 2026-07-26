@@ -1,0 +1,14 @@
+[package]
+name = "oxiz-grammar-fuzzer"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Grammar-driven differential fuzzer: generates SMT-LIB2 scripts and compares z3 vs oxiz verdicts."
+
+# A standalone dev tool. It has *zero* dependencies on the oxiz crates on
+# purpose: it drives both solvers as black-box subprocesses, so it keeps
+# building and stays reproducible no matter how oxiz's internal API changes.
+
+[[bin]]
+name = "oxiz-grammar-fuzzer"
+path = "src/main.rs"
