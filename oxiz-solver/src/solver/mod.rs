@@ -14,6 +14,7 @@ pub(super) mod config;
 pub(super) mod dt_axioms;
 pub(super) mod encode;
 pub(super) mod encode_guards;
+pub(super) mod equality_graph;
 pub(super) mod int_case_split;
 pub(super) mod ite_table;
 pub(super) mod model_builder;
@@ -917,6 +918,19 @@ impl Solver {
         }
         if self.config.max_decisions > 0 && self.statistics.decisions >= self.config.max_decisions {
             return SolverResult::Unknown;
+        }
+
+        // Equality-logic transitivity preprocessing (Sparse method, Bryant &
+        // Velev). Self-gates to pure equality logic; for families like
+        // `eq_diamond` it makes the search polynomial instead of 2^N. When it
+        // applies, the SAT core plus these clauses is a *complete* decision
+        // procedure for the formula, so we solve with plain SAT and skip the
+        // CDCL(T) loop entirely (the EUF theory would otherwise still emit the
+        // chain-conflict clauses that cause the exponential blowup). No-op for
+        // any formula with functions, arithmetic, bit-vectors, arrays, strings,
+        // or quantifiers.
+        if self.equality_transitivity_preprocess(manager) {
+            return self.solve_equality_via_sat(manager);
         }
 
         // Seam 1 of 2: rebuild all three incremental theory solvers from the
