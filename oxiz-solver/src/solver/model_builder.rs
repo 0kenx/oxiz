@@ -69,14 +69,28 @@ impl Solver {
                 let rhs_is_apply = manager
                     .get(*rhs)
                     .is_some_and(|t| matches!(t.kind, TermKind::Apply { .. }));
+                let is_str_var = |tid: TermId| -> bool {
+                    manager.get(tid).is_some_and(|t| {
+                        matches!(t.kind, TermKind::Var(_))
+                            && manager
+                                .sorts
+                                .get(t.sort)
+                                .is_some_and(|s| matches!(s.kind, oxiz_core::sort::SortKind::String))
+                    })
+                };
+                let lhs_is_str_var = is_str_var(*lhs);
+                let rhs_is_str_var = is_str_var(*rhs);
+
                 let (var_term, const_term) = if self.arith_terms.contains(lhs)
                     || self.bv_terms.contains(lhs)
                     || lhs_is_apply
+                    || lhs_is_str_var
                 {
                     (*lhs, *rhs)
                 } else if self.arith_terms.contains(rhs)
                     || self.bv_terms.contains(rhs)
                     || rhs_is_apply
+                    || rhs_is_str_var
                 {
                     (*rhs, *lhs)
                 } else {
@@ -104,6 +118,11 @@ impl Solver {
                             let value_term = manager.mk_bitvec(val, *width);
                             model.set(var_term, value_term);
                         }
+                    }
+                    TermKind::StringLit(s) => {
+                        let s = s.clone();
+                        let value_term = manager.mk_string_lit(&s);
+                        model.set(var_term, value_term);
                     }
                     _ => {}
                 }

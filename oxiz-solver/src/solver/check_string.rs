@@ -18,14 +18,16 @@ impl Solver {
 
         // First pass: collect all string assignments and constraints from assertions
         for &assertion in &self.assertions {
-            self.collect_string_constraints(
+            if self.collect_string_constraints(
                 assertion,
                 manager,
                 &mut string_assignments,
                 &mut length_constraints,
                 &mut concat_equalities,
                 &mut replace_all_constraints,
-            );
+            ) {
+                return true; // conflicting constant assignments
+            }
         }
 
         // Second pass: Now that all variable assignments are collected, resolve replace_all constraints
@@ -40,36 +42,93 @@ impl Solver {
         }
 
         // Check 1: Length vs concrete string conflicts (string_04 fix)
-        // If we have len(x) = n and x = "literal", check if len("literal") == n
         for (&var, &declared_len) in &length_constraints {
             if let Some(value) = string_assignments.get(&var) {
                 let actual_len = value.chars().count() as i64;
                 if actual_len != declared_len {
-                    return true; // Conflict: declared length != actual length
+                    return true;
                 }
             }
         }
 
-        // Check 2: Concatenation length consistency (string_02 fix)
-        // If we have concat(a, b, c) = "result", check if sum of lengths is consistent
+        // Check 2: Concatenation consistency against a concrete result.
         for (operands, result_str) in &concat_equalities {
             let result_len = result_str.chars().count() as i64;
-            let mut total_declared_len = 0i64;
-            let mut all_have_length = true;
+            let mut total_known_len = 0i64;
+            let mut all_known = true;
+            let mut known_prefix = String::new();
+            let mut prefix_broken = false;
+            let mut known_suffix_parts: Vec<String> = Vec::new();
 
             for operand in operands {
-                if let Some(&len) = length_constraints.get(operand) {
-                    total_declared_len += len;
-                } else if let Some(value) = string_assignments.get(operand) {
-                    total_declared_len += value.chars().count() as i64;
+                let concrete = string_assignments
+                    .get(operand)
+                    .cloned()
+                    .or_else(|| self.get_string_literal(*operand, manager));
+                if let Some(value) = concrete {
+                    total_known_len += value.chars().count() as i64;
+                    if !prefix_broken {
+                        known_prefix.push_str(&value);
+                    } else {
+                        known_suffix_parts.push(value);
+                    }
+                } else if let Some(&len) = length_constraints.get(operand) {
+                    total_known_len += len;
+                    prefix_broken = true;
+                    all_known = false;
                 } else {
-                    all_have_length = false;
-                    break;
+                    prefix_broken = true;
+                    all_known = false;
                 }
             }
 
-            if all_have_length && total_declared_len != result_len {
-                return true; // Conflict: sum of operand lengths != result length
+            if all_known {
+                let mut cat = String::new();
+                for op in operands {
+                    if let Some(v) = string_assignments.get(op) {
+                        cat.push_str(v);
+                    } else if let Some(lit) = self.get_string_literal(*op, manager) {
+                        cat.push_str(&lit);
+                    }
+                }
+                if cat != *result_str {
+                    return true;
+                }
+            } else {
+                // Leading concrete operands must form a prefix of the result
+                // (e.g. "a" ++ s = "bcd" is unsat).
+                if !known_prefix.is_empty() && !result_str.starts_with(&known_prefix) {
+                    return true;
+                }
+                // Trailing concrete operands (after the first unknown) must form
+                // a suffix when they are contiguous at the end.
+                if !known_suffix_parts.is_empty() {
+                    // Only treat as a firm suffix if the last operand(s) after the
+                    // first unknown are all concrete with no further unknowns —
+                    // already true by construction of known_suffix_parts only
+                    // collecting after prefix_broken, but unknowns in the middle
+                    // leave trailing parts that must still match if the trailing
+                    // run reaches the end.  Rebuild trailing run from the end.
+                    let mut trailing = String::new();
+                    for op in operands.iter().rev() {
+                        let concrete = string_assignments
+                            .get(op)
+                            .cloned()
+                            .or_else(|| self.get_string_literal(*op, manager));
+                        if let Some(v) = concrete {
+                            trailing = format!("{v}{trailing}");
+                        } else {
+                            break;
+                        }
+                    }
+                    if !trailing.is_empty() && !result_str.ends_with(&trailing) {
+                        return true;
+                    }
+                }
+                // Lower bound: sum of known pieces cannot exceed result length.
+                if total_known_len > result_len {
+                    return true;
+                }
             }
         }
 
@@ -110,7 +169,9 @@ impl Solver {
         false // No conflict found
     }
 
-    /// Recursively collect string constraints from a term
+    /// Recursively collect string constraints from a term.
+    /// Returns `true` if a definite conflict is found during collection
+    /// (e.g. the same variable equated to two different string literals).
     fn collect_string_constraints(
         &self,
         term: TermId,
@@ -119,24 +180,35 @@ impl Solver {
         length_constraints: &mut FxHashMap<TermId, i64>,
         concat_equalities: &mut Vec<(Vec<TermId>, String)>,
         replace_all_constraints: &mut Vec<(TermId, TermId, String, String, String)>,
-    ) {
+    ) -> bool {
         let Some(term_data) = manager.get(term) else {
-            return;
+            return false;
         };
 
         match &term_data.kind {
             // Handle equality: look for string-related equalities
             TermKind::Eq(lhs, rhs) => {
-                // Check for variable = string literal
+                // Variable = string literal (conflict if already assigned
+                // a different value — issue #14).
                 if let Some(lit) = self.get_string_literal(*rhs, manager) {
-                    // lhs = "literal"
                     if self.is_string_variable(*lhs, manager) {
-                        string_assignments.insert(*lhs, lit);
+                        if let Some(prev) = string_assignments.get(lhs) {
+                            if prev != &lit {
+                                return true;
+                            }
+                        } else {
+                            string_assignments.insert(*lhs, lit);
+                        }
                     }
                 } else if let Some(lit) = self.get_string_literal(*lhs, manager) {
-                    // "literal" = rhs
                     if self.is_string_variable(*rhs, manager) {
-                        string_assignments.insert(*rhs, lit);
+                        if let Some(prev) = string_assignments.get(rhs) {
+                            if prev != &lit {
+                                return true;
+                            }
+                        } else {
+                            string_assignments.insert(*rhs, lit);
+                        }
                     }
                 }
 
@@ -207,84 +279,93 @@ impl Solver {
                 }
 
                 // Recursively check children
-                self.collect_string_constraints(
+                if self.collect_string_constraints(
                     *lhs,
                     manager,
                     string_assignments,
                     length_constraints,
                     concat_equalities,
                     replace_all_constraints,
-                );
-                self.collect_string_constraints(
+                ) || self.collect_string_constraints(
                     *rhs,
                     manager,
                     string_assignments,
                     length_constraints,
                     concat_equalities,
                     replace_all_constraints,
-                );
+                ) {
+                    return true;
+                }
             }
 
             // Handle And: recurse into all conjuncts
             TermKind::And(args) => {
                 for &arg in args {
-                    self.collect_string_constraints(
+                    if self.collect_string_constraints(
                         arg,
                         manager,
                         string_assignments,
                         length_constraints,
                         concat_equalities,
                         replace_all_constraints,
-                    );
+                    ) {
+                        return true;
+                    }
                 }
             }
 
             // Handle other compound terms
             TermKind::Or(args) => {
                 for &arg in args {
-                    self.collect_string_constraints(
+                    if self.collect_string_constraints(
                         arg,
                         manager,
                         string_assignments,
                         length_constraints,
                         concat_equalities,
                         replace_all_constraints,
-                    );
+                    ) {
+                        return true;
+                    }
                 }
             }
 
             TermKind::Not(inner) => {
-                self.collect_string_constraints(
+                if self.collect_string_constraints(
                     *inner,
                     manager,
                     string_assignments,
                     length_constraints,
                     concat_equalities,
                     replace_all_constraints,
-                );
+                ) {
+                    return true;
+                }
             }
 
             TermKind::Implies(lhs, rhs) => {
-                self.collect_string_constraints(
+                if self.collect_string_constraints(
                     *lhs,
                     manager,
                     string_assignments,
                     length_constraints,
                     concat_equalities,
                     replace_all_constraints,
-                );
-                self.collect_string_constraints(
+                ) || self.collect_string_constraints(
                     *rhs,
                     manager,
                     string_assignments,
                     length_constraints,
                     concat_equalities,
                     replace_all_constraints,
-                );
+                ) {
+                    return true;
+                }
             }
 
             _ => {}
         }
+        false
     }
 
     /// Get string literal value from a term
@@ -514,13 +595,22 @@ impl Solver {
     ///
     /// Returns `true` only when a concrete assignment to every string variable
     /// makes the whole assertion set evaluate to `true` — a sound `Sat`
-    /// certificate. When no such witness is found within the search bounds it
-    /// returns `false`, and the caller keeps the honest `Unknown` verdict.
-    pub(super) fn ground_string_model_sat(&self, manager: &TermManager) -> bool {
-        matches!(
-            solve_ground_string(manager, &self.assertions),
-            GroundStringOutcome::Sat
-        )
+    /// certificate. On success the witness is installed into `self.model` so
+    /// `(get-model)` / `(get-value …)` work (issue #14). When no such witness
+    /// is found it returns `false`, and the caller keeps the honest `Unknown`.
+    pub(super) fn ground_string_model_sat(&mut self, manager: &mut TermManager) -> bool {
+        match solve_ground_string(manager, &self.assertions) {
+            GroundStringOutcome::Sat(assignment) => {
+                let mut model = super::types::Model::new();
+                for (term, value) in assignment {
+                    let lit = manager.mk_string_lit(&value);
+                    model.set(term, lit);
+                }
+                self.model = Some(model);
+                true
+            }
+            GroundStringOutcome::Unknown => false,
+        }
     }
 
     /// Returns `true` when the current assertion set contains any string-theory
