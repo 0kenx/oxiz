@@ -818,8 +818,18 @@ impl NlsatSolver {
                     continue;
                 }
                 TheoryPropagation::Unknown => {
-                    // A theory conflict we cannot soundly explain: report
-                    // Unknown rather than learning an invalid lemma.
+                    // A theory conflict we cannot soundly explain with a lemma.
+                    // Rather than concede `Unknown` immediately (which forfeits
+                    // satisfiable instances whose model sits behind a different
+                    // arithmetic sample), fall back to chronological arithmetic
+                    // backtracking: undo the latest arithmetic sample and try
+                    // another point. This is sound — it learns no lemma and only
+                    // re-explores arithmetic space — and bounded by the resample
+                    // budget; if every sample is exhausted we still report
+                    // `Unknown` exactly as before.
+                    if self.resample_previous_arith() {
+                        continue;
+                    }
                     return SolverResult::Unknown;
                 }
             }
