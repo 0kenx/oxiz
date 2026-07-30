@@ -1378,6 +1378,9 @@ impl Solver {
             side.push(manager.mk_implies(c_sub, eq_v_t));
             side.push(manager.mk_implies(not_c, eq_v_e));
         }
+        // Preserve define-fun body aliases / table-index keys across mux rewrite.
+        self.rebind_aliases_through_map(manager, &map);
+        self.rebind_table_indices_through_map(manager, &map);
         let rewritten = manager.substitute(term, &map);
         let mut parts = side;
         parts.insert(0, rewritten);

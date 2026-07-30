@@ -128,6 +128,11 @@ impl Solver {
             }
         }
 
+        // Keep define-fun aliases in sync when an inlined body is rewritten
+        // inside a later assertion (e.g. `(<= Discord 4)` with Discord inlined).
+        self.rebind_aliases_through_map(manager, &map);
+        self.rebind_table_indices_through_map(manager, &map);
+
         let rewritten = manager.substitute(term, &map);
         let side: Vec<TermId> = side
             .into_iter()
@@ -136,6 +141,51 @@ impl Solver {
         let mut parts = side;
         parts.insert(0, rewritten);
         manager.mk_and(parts)
+    }
+
+    pub(super) fn rebind_aliases_through_map(
+        &mut self,
+        manager: &mut TermManager,
+        map: &FxHashMap<TermId, TermId>,
+    ) {
+        if map.is_empty() || self.unit_eq_rep.is_empty() {
+            return;
+        }
+        let snapshot: Vec<(TermId, TermId)> = self.unit_eq_rep.iter().map(|(&k, &v)| (k, v)).collect();
+        for (body, rep) in snapshot {
+            let body2 = manager.substitute(body, map);
+            if body2 != body {
+                self.unit_eq_rep.insert(body2, rep);
+            }
+        }
+    }
+
+    pub(super) fn rebind_table_indices_through_map(
+        &mut self,
+        manager: &mut TermManager,
+        map: &FxHashMap<TermId, TermId>,
+    ) {
+        if map.is_empty() || self.table_index_keys.is_empty() {
+            return;
+        }
+        let snapshot: Vec<(TermId, Vec<i64>)> = self
+            .table_index_keys
+            .iter()
+            .map(|(&k, v)| (k, v.clone()))
+            .collect();
+        for (idx, keys) in snapshot {
+            let idx2 = manager.substitute(idx, map);
+            if idx2 != idx {
+                self.table_index_terms.insert(idx2);
+                let e = self.table_index_keys.entry(idx2).or_default();
+                for k in keys {
+                    if !e.contains(&k) {
+                        e.push(k);
+                    }
+                }
+                e.sort_unstable();
+            }
+        }
     }
 
     /// Collapse Discord/Fan-style nests over 0/1 table leaves into arithmetic.
@@ -204,6 +254,8 @@ impl Solver {
             if map.is_empty() {
                 break;
             }
+            self.rebind_aliases_through_map(manager, &map);
+            self.rebind_table_indices_through_map(manager, &map);
             cur = manager.substitute(cur, &map);
         }
         cur
@@ -251,42 +303,77 @@ impl Solver {
         if self.table_index_terms.is_empty() {
             return;
         }
+        let dbg = std::env::var("OXIZ_DBG_ITE").is_ok();
         let mut bounds: FxHashMap<TermId, (Option<i64>, Option<i64>)> = FxHashMap::default();
         for &assertion in &self.assertions {
-            collect_conjunctive_int_bounds(assertion, manager, &mut bounds);
+            collect_conjunctive_int_bounds(
+                assertion,
+                manager,
+                &mut bounds,
+                &self.unit_eq_rep,
+            );
         }
 
-        let indices: Vec<TermId> = self.table_index_terms.iter().copied().collect();
-        for idx in indices {
-            if self.case_split_terms.contains(&idx) {
+        // Group indices by representative so we case-split each domain once.
+        let mut by_rep: FxHashMap<TermId, Vec<TermId>> = FxHashMap::default();
+        for &idx in &self.table_index_terms {
+            let rep = self.unit_eq_rep.get(&idx).copied().unwrap_or(idx);
+            by_rep.entry(rep).or_default().push(idx);
+        }
+
+        for (rep, idxs) in by_rep {
+            if self.case_split_terms.contains(&rep) {
+                // Still bridge any new idx aliases.
+                if let Some(pairs) = self.table_index_domain_eqs.get(&rep).cloned() {
+                    for idx in idxs {
+                        if idx != rep && !self.case_split_terms.contains(&idx) {
+                            self.bridge_index_to_rep(idx, &pairs, manager, dbg);
+                        }
+                    }
+                }
                 continue;
             }
-            // Bounds may be on a define-fun name while the table indexes the
-            // inlined body — resolve via unit_eq_rep.
-            let rep = self.unit_eq_rep.get(&idx).copied().unwrap_or(idx);
-            let bound_key = rep;
-            let keys = self
-                .table_index_keys
-                .get(&idx)
-                .cloned()
-                .or_else(|| self.table_index_keys.get(&rep).cloned())
-                .unwrap_or_default();
 
-            let domain_vals: Option<Vec<i64>> = match bounds.get(&bound_key).or_else(|| bounds.get(&idx))
-            {
-                Some(&(Some(lo), Some(hi))) if hi >= lo && hi - lo <= MAX_EAGER_TABLE_DOMAIN => {
+            // Merge keys across all aliases of this rep.
+            let mut keys: Vec<i64> = Vec::new();
+            for &idx in &idxs {
+                if let Some(k) = self.table_index_keys.get(&idx) {
+                    for &v in k {
+                        if !keys.contains(&v) {
+                            keys.push(v);
+                        }
+                    }
+                }
+            }
+            keys.sort_unstable();
+
+            let mut b_lo: Option<i64> = None;
+            let mut b_hi: Option<i64> = None;
+            for (t, (lo, hi)) in &bounds {
+                let t_rep = self.unit_eq_rep.get(t).copied().unwrap_or(*t);
+                if *t == rep || t_rep == rep || idxs.contains(t) {
+                    if let Some(l) = lo {
+                        b_lo = Some(b_lo.map_or(*l, |x| x.max(*l)));
+                    }
+                    if let Some(h) = hi {
+                        b_hi = Some(b_hi.map_or(*h, |x| x.min(*h)));
+                    }
+                }
+            }
+
+            let domain_vals: Option<Vec<i64>> = match (b_lo, b_hi) {
+                (Some(lo), Some(hi)) if hi >= lo && hi - lo <= MAX_EAGER_TABLE_DOMAIN => {
                     Some((lo..=hi).collect())
                 }
-                Some(&(None, Some(hi))) if !keys.is_empty() => {
-                    let kmin = *keys.iter().min().unwrap();
-                    let kmax = *keys.iter().max().unwrap();
-                    if kmin >= 0 && kmax <= hi && hi - kmin <= MAX_EAGER_TABLE_DOMAIN {
-                        Some((kmin..=hi).collect())
+                (None, Some(hi)) if hi >= 0 && hi <= MAX_EAGER_TABLE_DOMAIN => {
+                    let lo = keys.iter().copied().min().unwrap_or(0).max(0);
+                    if lo <= hi {
+                        Some((lo..=hi).collect())
                     } else {
                         None
                     }
                 }
-                Some(&(Some(lo), None)) if !keys.is_empty() => {
+                (Some(lo), None) if !keys.is_empty() => {
                     let kmax = *keys.iter().max().unwrap();
                     if kmax >= lo && kmax - lo <= MAX_EAGER_TABLE_DOMAIN {
                         Some((lo..=kmax).collect())
@@ -296,20 +383,36 @@ impl Solver {
                 }
                 _ => None,
             };
+
             let Some(vals) = domain_vals else {
+                if dbg {
+                    eprintln!(
+                        "[ite] skip rep={} idxs={} keys={} lo={b_lo:?} hi={b_hi:?}",
+                        rep.0,
+                        idxs.len(),
+                        keys.len()
+                    );
+                }
                 continue;
             };
             if vals.is_empty() {
                 continue;
             }
+            if dbg {
+                eprintln!(
+                    "[ite] SPLIT rep={} n_idx={} domain={}..{}",
+                    rep.0,
+                    idxs.len(),
+                    vals.first().unwrap(),
+                    vals.last().unwrap()
+                );
+            }
 
-            // Case-split the representative (named var when available).
-            let split_term = rep;
             let mut pairs: Vec<(i64, Lit)> = Vec::with_capacity(vals.len());
             let mut lits: Vec<Lit> = Vec::with_capacity(vals.len());
             for k in &vals {
                 let k_term = manager.mk_int(*k);
-                let eq = manager.mk_eq(split_term, k_term);
+                let eq = manager.mk_eq(rep, k_term);
                 let lit = self.encode_depth(eq, manager, 0);
                 pairs.push((*k, lit));
                 lits.push(lit);
@@ -321,27 +424,39 @@ impl Solver {
                         .add_clause([lits[i].negate(), lits[j].negate()]);
                 }
             }
-            self.table_index_domain_eqs.insert(split_term, pairs.clone());
-            self.case_split_terms.insert(split_term);
+            self.table_index_domain_eqs.insert(rep, pairs.clone());
+            self.case_split_terms.insert(rep);
 
-            // Bridge inlined body index ↔ name so table implications on `idx`
-            // unit-propagate from the domain split on `rep`.
-            if idx != split_term {
-                let mut idx_pairs: Vec<(i64, Lit)> = Vec::with_capacity(vals.len());
-                for (i, k) in vals.iter().enumerate() {
-                    let k_term = manager.mk_int(*k);
-                    let eq_idx = manager.mk_eq(idx, k_term);
-                    let lit_idx = self.encode_depth(eq_idx, manager, 0);
-                    let lit_rep = lits[i];
-                    // (= rep k) ↔ (= idx k)
-                    self.sat.add_clause([lit_rep.negate(), lit_idx]);
-                    self.sat.add_clause([lit_idx.negate(), lit_rep]);
-                    idx_pairs.push((*k, lit_idx));
+            for idx in idxs {
+                if idx != rep {
+                    self.bridge_index_to_rep(idx, &pairs, manager, dbg);
                 }
-                self.table_index_domain_eqs.insert(idx, idx_pairs);
-                self.case_split_terms.insert(idx);
             }
         }
+    }
+
+    fn bridge_index_to_rep(
+        &mut self,
+        idx: TermId,
+        rep_pairs: &[(i64, Lit)],
+        manager: &mut TermManager,
+        dbg: bool,
+    ) {
+        if self.case_split_terms.contains(&idx) {
+            return;
+        }
+        let _ = dbg;
+        let mut idx_pairs: Vec<(i64, Lit)> = Vec::with_capacity(rep_pairs.len());
+        for &(k, lit_rep) in rep_pairs {
+            let k_term = manager.mk_int(k);
+            let eq_idx = manager.mk_eq(idx, k_term);
+            let lit_idx = self.encode_depth(eq_idx, manager, 0);
+            self.sat.add_clause([lit_rep.negate(), lit_idx]);
+            self.sat.add_clause([lit_idx.negate(), lit_rep]);
+            idx_pairs.push((k, lit_idx));
+        }
+        self.table_index_domain_eqs.insert(idx, idx_pairs);
+        self.case_split_terms.insert(idx);
     }
 
     /// Boolean-link comparison atoms on table indices to domain eqs.
@@ -614,6 +729,7 @@ fn collect_conjunctive_int_bounds(
     term: TermId,
     manager: &TermManager,
     bounds: &mut FxHashMap<TermId, (Option<i64>, Option<i64>)>,
+    aliases: &FxHashMap<TermId, TermId>,
 ) {
     let Some(t) = manager.get(term) else {
         return;
@@ -621,19 +737,22 @@ fn collect_conjunctive_int_bounds(
     match &t.kind {
         TermKind::And(args) => {
             for &a in args {
-                collect_conjunctive_int_bounds(a, manager, bounds);
+                collect_conjunctive_int_bounds(a, manager, bounds, aliases);
             }
         }
-        TermKind::Ge(a, b) => note_ge(*a, *b, false, manager, bounds),
-        TermKind::Gt(a, b) => note_ge(*a, *b, true, manager, bounds),
-        TermKind::Le(a, b) => note_le(*a, *b, false, manager, bounds),
-        TermKind::Lt(a, b) => note_le(*a, *b, true, manager, bounds),
+        TermKind::Ge(a, b) => note_ge(*a, *b, false, manager, bounds, aliases),
+        TermKind::Gt(a, b) => note_ge(*a, *b, true, manager, bounds, aliases),
+        TermKind::Le(a, b) => note_le(*a, *b, false, manager, bounds, aliases),
+        TermKind::Lt(a, b) => note_le(*a, *b, true, manager, bounds, aliases),
         TermKind::Eq(a, b) => {
-            if let (Some(v), Some(c)) = (var_term(*a, manager), int_const_val(*b, manager)) {
+            if let (Some(v), Some(c)) = (bound_term(*a, manager, aliases), int_const_val(*b, manager))
+            {
                 let e = bounds.entry(v).or_insert((None, None));
                 e.0 = Some(e.0.map_or(c, |x| x.max(c)));
                 e.1 = Some(e.1.map_or(c, |x| x.min(c)));
-            } else if let (Some(c), Some(v)) = (int_const_val(*a, manager), var_term(*b, manager)) {
+            } else if let (Some(c), Some(v)) =
+                (int_const_val(*a, manager), bound_term(*b, manager, aliases))
+            {
                 let e = bounds.entry(v).or_insert((None, None));
                 e.0 = Some(e.0.map_or(c, |x| x.max(c)));
                 e.1 = Some(e.1.map_or(c, |x| x.min(c)));
@@ -643,7 +762,15 @@ fn collect_conjunctive_int_bounds(
     }
 }
 
-fn var_term(term: TermId, manager: &TermManager) -> Option<TermId> {
+/// Variable, or define-fun alias representative for a (possibly inlined) body.
+fn bound_term(
+    term: TermId,
+    manager: &TermManager,
+    aliases: &FxHashMap<TermId, TermId>,
+) -> Option<TermId> {
+    if let Some(&rep) = aliases.get(&term) {
+        return Some(rep);
+    }
     match manager.get(term)?.kind {
         TermKind::Var(_) => Some(term),
         _ => None,
@@ -656,12 +783,13 @@ fn note_ge(
     strict: bool,
     manager: &TermManager,
     bounds: &mut FxHashMap<TermId, (Option<i64>, Option<i64>)>,
+    aliases: &FxHashMap<TermId, TermId>,
 ) {
-    if let (Some(v), Some(c)) = (var_term(a, manager), int_const_val(b, manager)) {
+    if let (Some(v), Some(c)) = (bound_term(a, manager, aliases), int_const_val(b, manager)) {
         let lo = if strict { c + 1 } else { c };
         let e = bounds.entry(v).or_insert((None, None));
         e.0 = Some(e.0.map_or(lo, |x| x.max(lo)));
-    } else if let (Some(c), Some(v)) = (int_const_val(a, manager), var_term(b, manager)) {
+    } else if let (Some(c), Some(v)) = (int_const_val(a, manager), bound_term(b, manager, aliases)) {
         let hi = if strict { c - 1 } else { c };
         let e = bounds.entry(v).or_insert((None, None));
         e.1 = Some(e.1.map_or(hi, |x| x.min(hi)));
@@ -674,14 +802,33 @@ fn note_le(
     strict: bool,
     manager: &TermManager,
     bounds: &mut FxHashMap<TermId, (Option<i64>, Option<i64>)>,
+    aliases: &FxHashMap<TermId, TermId>,
 ) {
-    if let (Some(v), Some(c)) = (var_term(a, manager), int_const_val(b, manager)) {
+    if let (Some(v), Some(c)) = (bound_term(a, manager, aliases), int_const_val(b, manager)) {
         let hi = if strict { c - 1 } else { c };
         let e = bounds.entry(v).or_insert((None, None));
         e.1 = Some(e.1.map_or(hi, |x| x.min(hi)));
-    } else if let (Some(c), Some(v)) = (int_const_val(a, manager), var_term(b, manager)) {
+        // Also bind the raw term so rewritten inlined bodies keep the bound.
+        if a != v {
+            let e2 = bounds.entry(a).or_insert((None, None));
+            e2.1 = Some(e2.1.map_or(hi, |x| x.min(hi)));
+        }
+    } else if let (Some(c), Some(v)) = (int_const_val(a, manager), bound_term(b, manager, aliases)) {
         let lo = if strict { c + 1 } else { c };
         let e = bounds.entry(v).or_insert((None, None));
+        e.0 = Some(e.0.map_or(lo, |x| x.max(lo)));
+        if b != v {
+            let e2 = bounds.entry(b).or_insert((None, None));
+            e2.0 = Some(e2.0.map_or(lo, |x| x.max(lo)));
+        }
+    } else if let Some(c) = int_const_val(b, manager) {
+        // Complex term without alias: still record hi on the term itself.
+        let hi = if strict { c - 1 } else { c };
+        let e = bounds.entry(a).or_insert((None, None));
+        e.1 = Some(e.1.map_or(hi, |x| x.min(hi)));
+    } else if let Some(c) = int_const_val(a, manager) {
+        let lo = if strict { c + 1 } else { c };
+        let e = bounds.entry(b).or_insert((None, None));
         e.0 = Some(e.0.map_or(lo, |x| x.max(lo)));
     }
 }
