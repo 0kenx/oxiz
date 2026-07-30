@@ -164,6 +164,15 @@ pub struct Solver {
     /// and used to boolean-link comparison atoms (`>`, `>=`, …) so nested ite
     /// guards like `(> j0 0)` unit-propagate once a domain value is chosen.
     pub(super) table_index_domain_eqs: FxHashMap<TermId, Vec<(i64, oxiz_sat::Lit)>>,
+    /// Terms known to be 0/1-valued (flattened binary tables + folds).
+    pub(super) zero_one_terms: FxHashSet<TermId>,
+    /// Union of equality-ite keys seen for each table index (for domain split
+    /// when only a one-sided bound is asserted).
+    pub(super) table_index_keys: FxHashMap<TermId, Vec<i64>>,
+    /// Unit equality aliases from nullary define-fun (`(= name body)`): map both
+    /// sides to the named variable so bounds on `name` apply to inlined `body`
+    /// table indices (EM inlines Discord's body at parse time).
+    pub(super) unit_eq_rep: FxHashMap<TermId, TermId>,
     /// Datatype constructor constraints: variable -> constructor name
     /// Used to detect mutual exclusivity conflicts (var = C1 AND var = C2 where C1 != C2)
     pub(super) dt_var_constructors: FxHashMap<TermId, oxiz_core::interner::Spur>,
@@ -420,6 +429,9 @@ impl Solver {
             care_split_pairs: FxHashSet::default(),
             table_index_terms: FxHashSet::default(),
             table_index_domain_eqs: FxHashMap::default(),
+            zero_one_terms: FxHashSet::default(),
+            table_index_keys: FxHashMap::default(),
+            unit_eq_rep: FxHashMap::default(),
             dt_var_constructors: FxHashMap::default(),
             arith_parse_cache: FxHashMap::default(),
             tracked_compound_terms: FxHashSet::default(),
@@ -2073,6 +2085,9 @@ impl Solver {
         self.care_split_pairs.clear();
         self.table_index_terms.clear();
         self.table_index_domain_eqs.clear();
+        self.zero_one_terms.clear();
+        self.table_index_keys.clear();
+        self.unit_eq_rep.clear();
         self.dt_var_constructors.clear();
         self.arith_parse_cache.clear();
         self.tracked_compound_terms.clear();

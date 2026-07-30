@@ -170,6 +170,17 @@ impl super::Solver {
             // a stale entry only makes `link_table_index_comparisons` re-link a
             // *valid* (redundant) implication, so it is sound to leave it
             // (cleared only by `reset`).
+            zero_one_terms: _, // accumulates known 0/1-valued terms across `assert`s;
+            // a stale entry only makes later folds/splits re-apply *valid*
+            // (redundant) rewrites, so it is sound to leave it (cleared only by
+            // `reset`).
+            table_index_keys: _, // accumulates equality-ite keys per index across
+            // `assert`s; a stale entry only widens a *valid* domain split, so it
+            // is sound to leave it (cleared only by `reset`).
+            unit_eq_rep: _, // accumulates nullary define-fun `(= name body)` aliases;
+            // a stale entry only makes a domain split inherit a *valid* (possibly
+            // redundant) bound, so it is sound to leave it (cleared only by
+            // `reset`).
             dt_var_constructors: _,      // TRAIL: DtVarConstructorAdded
             arith_parse_cache: _,        // INVARIANT: keyed by term structure
             tracked_compound_terms: _,   // TRAIL: TrackedCompoundAdded

@@ -496,10 +496,16 @@ impl Solver {
     /// `Solver::invalidate_results` (private) for the rule and for why the unsat
     /// core goes with it.
     pub fn assert(&mut self, term: TermId, manager: &mut TermManager) {
+        // Alias before rewrite: nullary define-fun `(= name body)` must link the
+        // pre-inline `body` TermId (which later asserts re-use via parser
+        // bindings) to `name` for domain splits.
+        self.note_unit_eq_alias(term, manager);
         // Collapse long `(ite (= x c_i) e_i …)` lookup spines into one result
         // var + flat implications before generic ite elimination (avoids O(n)
         // chained mux vars on tool-generated finite maps).
         let term = self.flatten_eq_ite_tables(term, manager);
+        // Collapse 0/1 Discord/Fan nests to arithmetic before mux expansion.
+        let term = self.fold_zero_one_nests(term, manager);
         // Eliminate non-Bool `ite` (mux) subterms into fresh constants plus
         // conditional side-conditions, so EUF sees the selected-branch equality
         // in every position (direct equality operand, nested in an app arg, …).
@@ -627,6 +633,10 @@ impl Solver {
         // Encode the assertion immediately
         let lit = self.encode(term_to_encode, manager);
         self.sat.add_clause([lit]);
+
+        // Track unit `(= name body)` from nullary define-fun so table indices
+        // that are inlined bodies inherit bounds on `name`.
+        self.note_unit_eq_alias(term_to_encode, manager);
 
         // For Not(Eq(a,b)) assertions on arithmetic terms, eagerly add the
         // arithmetic disequality split (a<b OR a>b) so that ArithSolver assigns

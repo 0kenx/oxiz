@@ -8,10 +8,11 @@
 //!
 //! This pass:
 //! 1. Collapses each long equality-spine into one result + implications
-//! 2. Eagerly case-splits table indices with small asserted bounds (ALO+AMO)
-//! 3. Boolean-links comparison atoms (`(> idx c)`) to those domain eqs
+//! 2. Folds 0/1 Discord/Fan nests (`ite(>t 0,t,0)→t`, `max→a+b−ab`, …)
+//! 3. Eagerly case-splits table indices with small asserted bounds (ALO+AMO)
+//! 4. Boolean-links comparison atoms (`(> idx c)`) to those domain eqs
 //!
-//! so nested tool-generated nests unit-propagate once an index is decided.
+//! so nested tool-generated nests unit-propagate / collapse once indices pin.
 
 use num_traits::ToPrimitive;
 use oxiz_core::ast::{TermId, TermKind, TermManager, collect_subterms};
@@ -80,19 +81,51 @@ impl Solver {
             let r = manager.mk_var(&format!("__oxiz_tbl_{}_{}", m.root.0, i), sort);
             self.ite_result_terms.insert(r);
             self.table_index_terms.insert(m.index);
+            {
+                let keys = self.table_index_keys.entry(m.index).or_default();
+                for &(k, _) in &m.cases {
+                    if !keys.contains(&k) {
+                        keys.push(k);
+                    }
+                }
+                keys.sort_unstable();
+            }
             map.insert(m.root, r);
 
             let mut not_cases: Vec<TermId> = Vec::with_capacity(m.cases.len());
+            let mut const_vals: Vec<i64> = Vec::new();
+            let mut all_const = true;
             for &(k, then_br) in &m.cases {
                 let k_term = manager.mk_int(k);
                 let eq_idx = manager.mk_eq(m.index, k_term);
                 let eq_r = manager.mk_eq(r, then_br);
                 side.push(manager.mk_implies(eq_idx, eq_r));
                 not_cases.push(manager.mk_not(eq_idx));
+                match int_const_val(then_br, manager) {
+                    Some(v) => const_vals.push(v),
+                    None => all_const = false,
+                }
             }
             let none = manager.mk_and(not_cases);
             let eq_def = manager.mk_eq(r, m.default);
             side.push(manager.mk_implies(none, eq_def));
+            if all_const {
+                if let Some(v) = int_const_val(m.default, manager) {
+                    const_vals.push(v);
+                } else {
+                    all_const = false;
+                }
+            }
+            if all_const {
+                const_vals.sort_unstable();
+                const_vals.dedup();
+                // Track 0/1 (and tiny) images for nest folding.
+                if !const_vals.is_empty()
+                    && const_vals.iter().all(|&v| v == 0 || v == 1)
+                {
+                    self.zero_one_terms.insert(r);
+                }
+            }
         }
 
         let rewritten = manager.substitute(term, &map);
@@ -103,6 +136,114 @@ impl Solver {
         let mut parts = side;
         parts.insert(0, rewritten);
         manager.mk_and(parts)
+    }
+
+    /// Collapse Discord/Fan-style nests over 0/1 table leaves into arithmetic.
+    ///
+    /// Rewrites (bottom-up, iterated to fixpoint, capped):
+    /// - `ite(> t 0, t, 0) → t` when `t` is 0/1-valued
+    /// - `ite(> t 0, 1, 0) → t` when `t` is 0/1-valued
+    /// - `ite(> a b, a, b) → a+b−a·b` (max) when both are 0/1-valued
+    /// - `ite(< x 0, −x, x) → x·x` (abs) when `x` is in {−1,0,1} as a−b of 0/1s
+    ///
+    /// Marks derived terms as 0/1 so outer folds fire.
+    pub(super) fn fold_zero_one_nests(
+        &mut self,
+        term: TermId,
+        manager: &mut TermManager,
+    ) -> TermId {
+        if self.zero_one_terms.is_empty() {
+            return term;
+        }
+        let bool_sort = manager.sorts.bool_sort;
+        let mut cur = term;
+        for _ in 0..8 {
+            let subterms = collect_subterms(cur, manager);
+            let mut map: FxHashMap<TermId, TermId> = FxHashMap::default();
+            let mut zo = self.zero_one_terms.clone();
+
+            for st in subterms {
+                let Some(t) = manager.get(st) else { continue };
+                if t.sort == bool_sort {
+                    continue;
+                }
+                let out = match &t.kind {
+                    TermKind::Ite(c0, th0, el0) => {
+                        let c = *map.get(c0).unwrap_or(c0);
+                        let th = *map.get(th0).unwrap_or(th0);
+                        let el = *map.get(el0).unwrap_or(el0);
+                        fold_one_ite(c, th, el, manager, &mut zo)
+                    }
+                    TermKind::Add(args) => {
+                        let args: Vec<TermId> =
+                            args.iter().map(|a| *map.get(a).unwrap_or(a)).collect();
+                        // sum of 0/1 is not necessarily 0/1
+                        manager.mk_add(args)
+                    }
+                    TermKind::Sub(a0, b0) => {
+                        let a = *map.get(a0).unwrap_or(a0);
+                        let b = *map.get(b0).unwrap_or(b0);
+                        manager.mk_sub(a, b)
+                    }
+                    TermKind::Mul(args) => {
+                        let args: Vec<TermId> =
+                            args.iter().map(|a| *map.get(a).unwrap_or(a)).collect();
+                        let m = manager.mk_mul(args.clone());
+                        if args.iter().all(|a| zo.contains(a)) {
+                            zo.insert(m);
+                        }
+                        m
+                    }
+                    _ => continue,
+                };
+                if out != st {
+                    map.insert(st, out);
+                }
+            }
+            self.zero_one_terms = zo;
+            if map.is_empty() {
+                break;
+            }
+            cur = manager.substitute(cur, &map);
+        }
+        cur
+    }
+
+    /// Record unit top-level `(= var t)` so bounds on `var` apply to `t`.
+    pub(super) fn note_unit_eq_alias(&mut self, term: TermId, manager: &TermManager) {
+        // Peel a top-level and to find bare equalities.
+        let mut stack = vec![term];
+        while let Some(t) = stack.pop() {
+            let Some(node) = manager.get(t) else {
+                continue;
+            };
+            match &node.kind {
+                TermKind::And(args) => stack.extend(args.iter().copied()),
+                TermKind::Eq(a, b) => {
+                    let (a, b) = (*a, *b);
+                    let a_var = matches!(manager.get(a).map(|x| &x.kind), Some(TermKind::Var(_)));
+                    let b_var = matches!(manager.get(b).map(|x| &x.kind), Some(TermKind::Var(_)));
+                    match (a_var, b_var) {
+                        (true, false) => {
+                            self.unit_eq_rep.entry(a).or_insert(a);
+                            self.unit_eq_rep.insert(b, a);
+                        }
+                        (false, true) => {
+                            self.unit_eq_rep.entry(b).or_insert(b);
+                            self.unit_eq_rep.insert(a, b);
+                        }
+                        (true, true) => {
+                            // Prefer lower id as rep
+                            let (rep, oth) = if a.0 <= b.0 { (a, b) } else { (b, a) };
+                            self.unit_eq_rep.entry(rep).or_insert(rep);
+                            self.unit_eq_rep.insert(oth, rep);
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Eager finite-domain case-split on table indices with small asserted bounds.
@@ -120,19 +261,57 @@ impl Solver {
             if self.case_split_terms.contains(&idx) {
                 continue;
             }
-            let Some(&(Some(lo), Some(hi))) = bounds.get(&idx) else {
+            // Bounds may be on a define-fun name while the table indexes the
+            // inlined body — resolve via unit_eq_rep.
+            let rep = self.unit_eq_rep.get(&idx).copied().unwrap_or(idx);
+            let bound_key = rep;
+            let keys = self
+                .table_index_keys
+                .get(&idx)
+                .cloned()
+                .or_else(|| self.table_index_keys.get(&rep).cloned())
+                .unwrap_or_default();
+
+            let domain_vals: Option<Vec<i64>> = match bounds.get(&bound_key).or_else(|| bounds.get(&idx))
+            {
+                Some(&(Some(lo), Some(hi))) if hi >= lo && hi - lo <= MAX_EAGER_TABLE_DOMAIN => {
+                    Some((lo..=hi).collect())
+                }
+                Some(&(None, Some(hi))) if !keys.is_empty() => {
+                    let kmin = *keys.iter().min().unwrap();
+                    let kmax = *keys.iter().max().unwrap();
+                    if kmin >= 0 && kmax <= hi && hi - kmin <= MAX_EAGER_TABLE_DOMAIN {
+                        Some((kmin..=hi).collect())
+                    } else {
+                        None
+                    }
+                }
+                Some(&(Some(lo), None)) if !keys.is_empty() => {
+                    let kmax = *keys.iter().max().unwrap();
+                    if kmax >= lo && kmax - lo <= MAX_EAGER_TABLE_DOMAIN {
+                        Some((lo..=kmax).collect())
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            let Some(vals) = domain_vals else {
                 continue;
             };
-            if hi < lo || hi - lo > MAX_EAGER_TABLE_DOMAIN {
+            if vals.is_empty() {
                 continue;
             }
-            let mut pairs: Vec<(i64, Lit)> = Vec::with_capacity((hi - lo + 1) as usize);
-            let mut lits: Vec<Lit> = Vec::with_capacity((hi - lo + 1) as usize);
-            for k in lo..=hi {
-                let k_term = manager.mk_int(k);
-                let eq = manager.mk_eq(idx, k_term);
+
+            // Case-split the representative (named var when available).
+            let split_term = rep;
+            let mut pairs: Vec<(i64, Lit)> = Vec::with_capacity(vals.len());
+            let mut lits: Vec<Lit> = Vec::with_capacity(vals.len());
+            for k in &vals {
+                let k_term = manager.mk_int(*k);
+                let eq = manager.mk_eq(split_term, k_term);
                 let lit = self.encode_depth(eq, manager, 0);
-                pairs.push((k, lit));
+                pairs.push((*k, lit));
                 lits.push(lit);
             }
             self.sat.add_clause(lits.clone());
@@ -142,8 +321,26 @@ impl Solver {
                         .add_clause([lits[i].negate(), lits[j].negate()]);
                 }
             }
-            self.table_index_domain_eqs.insert(idx, pairs);
-            self.case_split_terms.insert(idx);
+            self.table_index_domain_eqs.insert(split_term, pairs.clone());
+            self.case_split_terms.insert(split_term);
+
+            // Bridge inlined body index ↔ name so table implications on `idx`
+            // unit-propagate from the domain split on `rep`.
+            if idx != split_term {
+                let mut idx_pairs: Vec<(i64, Lit)> = Vec::with_capacity(vals.len());
+                for (i, k) in vals.iter().enumerate() {
+                    let k_term = manager.mk_int(*k);
+                    let eq_idx = manager.mk_eq(idx, k_term);
+                    let lit_idx = self.encode_depth(eq_idx, manager, 0);
+                    let lit_rep = lits[i];
+                    // (= rep k) ↔ (= idx k)
+                    self.sat.add_clause([lit_rep.negate(), lit_idx]);
+                    self.sat.add_clause([lit_idx.negate(), lit_rep]);
+                    idx_pairs.push((*k, lit_idx));
+                }
+                self.table_index_domain_eqs.insert(idx, idx_pairs);
+                self.case_split_terms.insert(idx);
+            }
         }
     }
 
@@ -229,6 +426,108 @@ enum CompKind {
     Le,
     Gt,
     Ge,
+}
+
+/// Fold one arithmetic ite given already-rewritten children.
+fn fold_one_ite(
+    c: TermId,
+    th: TermId,
+    el: TermId,
+    manager: &mut TermManager,
+    zo: &mut FxHashSet<TermId>,
+) -> TermId {
+    if th == el {
+        if zo.contains(&th) {
+            zo.insert(th);
+        }
+        return th;
+    }
+
+    // ite(> t 0, t, 0) → t when t is 0/1
+    if is_gt_zero_of(c, th, manager) && is_int_const(el, 0, manager) && zo.contains(&th) {
+        return th;
+    }
+    // ite(> t 0, 1, 0) → t when t is 0/1
+    if let Some(t) = gt_zero_lhs(c, manager) {
+        if is_int_const(th, 1, manager) && is_int_const(el, 0, manager) && zo.contains(&t) {
+            return t;
+        }
+    }
+    // ite(> a b, a, b) → max = a+b−a·b when both 0/1
+    if is_gt_of(c, th, el, manager) && zo.contains(&th) && zo.contains(&el) {
+        let sum = manager.mk_add([th, el]);
+        let prod = manager.mk_mul([th, el]);
+        let mx = manager.mk_sub(sum, prod);
+        zo.insert(mx);
+        return mx;
+    }
+    // ite(< x 0, −x, x) → x·x when x is a−b of 0/1s (abs on {-1,0,1})
+    if let Some(x) = lt_zero_lhs(c, manager) {
+        if el == x && is_negation_of(th, x, manager) && is_zo_diff(x, manager, zo) {
+            let a = manager.mk_mul([x, x]);
+            zo.insert(a); // abs ∈ {0,1}
+            return a;
+        }
+    }
+
+    // ite(c, zo, zo) stays 0/1
+    let rebuilt = manager.mk_ite(c, th, el);
+    if zo.contains(&th) && zo.contains(&el) {
+        zo.insert(rebuilt);
+    }
+    rebuilt
+}
+
+fn is_int_const(term: TermId, want: i64, manager: &TermManager) -> bool {
+    int_const_val(term, manager) == Some(want)
+}
+
+fn is_gt_zero_of(cond: TermId, term: TermId, manager: &TermManager) -> bool {
+    match manager.get(cond).map(|t| &t.kind) {
+        Some(TermKind::Gt(a, b)) => *a == term && is_int_const(*b, 0, manager),
+        _ => false,
+    }
+}
+
+fn is_gt_of(cond: TermId, a: TermId, b: TermId, manager: &TermManager) -> bool {
+    match manager.get(cond).map(|t| &t.kind) {
+        Some(TermKind::Gt(x, y)) => *x == a && *y == b,
+        _ => false,
+    }
+}
+
+fn gt_zero_lhs(cond: TermId, manager: &TermManager) -> Option<TermId> {
+    match manager.get(cond).map(|t| &t.kind) {
+        Some(TermKind::Gt(a, b)) if is_int_const(*b, 0, manager) => Some(*a),
+        _ => None,
+    }
+}
+
+fn lt_zero_lhs(cond: TermId, manager: &TermManager) -> Option<TermId> {
+    match manager.get(cond).map(|t| &t.kind) {
+        Some(TermKind::Lt(a, b)) if is_int_const(*b, 0, manager) => Some(*a),
+        _ => None,
+    }
+}
+
+fn is_negation_of(term: TermId, x: TermId, manager: &mut TermManager) -> bool {
+    match manager.get(term).map(|t| t.kind.clone()) {
+        Some(TermKind::Neg(a)) => a == x,
+        Some(TermKind::Sub(a, b)) => is_int_const(a, 0, manager) && b == x,
+        _ => {
+            // Hash-cons check against freshly built (0 − x)
+            let zero = manager.mk_int(0);
+            term == manager.mk_sub(zero, x)
+        }
+    }
+}
+
+fn is_zo_diff(x: TermId, manager: &TermManager, zo: &FxHashSet<TermId>) -> bool {
+    match manager.get(x).map(|t| &t.kind) {
+        Some(TermKind::Sub(a, b)) => zo.contains(a) && zo.contains(b),
+        Some(TermKind::Neg(a)) => zo.contains(a),
+        _ => false,
+    }
 }
 
 fn match_eq_ite_table(
@@ -528,6 +827,72 @@ mod tests {
         solver.assert(eq_rv, &mut m);
         let gt = m.mk_gt(x, zero);
         solver.assert(gt, &mut m);
+        assert_eq!(solver.check(&mut m), SolverResult::Sat);
+    }
+
+    #[test]
+    fn zero_one_max_fold_sat() {
+        let mut solver = Solver::new();
+        let mut m = TermManager::new();
+        let x = m.mk_var("x", m.sorts.int_sort);
+        let y = m.mk_var("y", m.sorts.int_sort);
+        let z = m.mk_var("z", m.sorts.int_sort);
+        let zero = m.mk_int(0);
+        let one = m.mk_int(1);
+        let three = m.mk_int(3);
+        let ge_x = m.mk_ge(x, zero);
+        let le_x = m.mk_le(x, one);
+        let ge_y = m.mk_ge(y, zero);
+        let le_y = m.mk_le(y, one);
+        let ge_z = m.mk_ge(z, zero);
+        let le_z = m.mk_le(z, three);
+        solver.assert(ge_x, &mut m);
+        solver.assert(le_x, &mut m);
+        solver.assert(ge_y, &mut m);
+        solver.assert(le_y, &mut m);
+        solver.assert(ge_z, &mut m);
+        solver.assert(le_z, &mut m);
+        let mut tx = zero;
+        for k in (0..=3).rev() {
+            let kt = m.mk_int(k);
+            let cond = m.mk_eq(x, kt);
+            let val = m.mk_int(if k <= 1 { k } else { 0 });
+            tx = m.mk_ite(cond, val, tx);
+        }
+        let mut ty = zero;
+        for k in (0..=3).rev() {
+            let kt = m.mk_int(k);
+            let cond = m.mk_eq(y, kt);
+            let val = m.mk_int(if k <= 1 { k } else { 0 });
+            ty = m.mk_ite(cond, val, ty);
+        }
+        let mut tz = zero;
+        for k in (0..=3).rev() {
+            let kt = m.mk_int(k);
+            let cond = m.mk_eq(z, kt);
+            let val = m.mk_int(if k <= 1 { k } else { 0 });
+            tz = m.mk_ite(cond, val, tz);
+        }
+        let rx = m.mk_var("rx", m.sorts.int_sort);
+        let ry = m.mk_var("ry", m.sorts.int_sort);
+        let rz = m.mk_var("rz", m.sorts.int_sort);
+        let eq_rx = m.mk_eq(rx, tx);
+        let eq_ry = m.mk_eq(ry, ty);
+        let eq_rz = m.mk_eq(rz, tz);
+        solver.assert(eq_rx, &mut m);
+        solver.assert(eq_ry, &mut m);
+        solver.assert(eq_rz, &mut m);
+        let gt = m.mk_gt(rx, ry);
+        let mx = m.mk_ite(gt, rx, ry);
+        let r = m.mk_var("r", m.sorts.int_sort);
+        let eq_r = m.mk_eq(r, mx);
+        solver.assert(eq_r, &mut m);
+        let eq_x = m.mk_eq(x, one);
+        let eq_y = m.mk_eq(y, zero);
+        let eq_rv = m.mk_eq(r, one);
+        solver.assert(eq_x, &mut m);
+        solver.assert(eq_y, &mut m);
+        solver.assert(eq_rv, &mut m);
         assert_eq!(solver.check(&mut m), SolverResult::Sat);
     }
 
