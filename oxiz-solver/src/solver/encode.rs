@@ -496,6 +496,10 @@ impl Solver {
     /// `Solver::invalidate_results` (private) for the rule and for why the unsat
     /// core goes with it.
     pub fn assert(&mut self, term: TermId, manager: &mut TermManager) {
+        // Collapse long `(ite (= x c_i) e_i …)` lookup spines into one result
+        // var + flat implications before generic ite elimination (avoids O(n)
+        // chained mux vars on tool-generated finite maps).
+        let term = self.flatten_eq_ite_tables(term, manager);
         // Eliminate non-Bool `ite` (mux) subterms into fresh constants plus
         // conditional side-conditions, so EUF sees the selected-branch equality
         // in every position (direct equality operand, nested in an app arg, …).

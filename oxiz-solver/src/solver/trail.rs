@@ -161,6 +161,15 @@ impl super::Solver {
             // a stale entry after `pop` only makes `axiomatize_arith_constant_
             // equalities` re-emit a *valid* (redundant) triangle axiom, so it is
             // sound to leave it (cleared wholesale only by `reset`).
+            table_index_terms: _, // accumulates equality-ite table indices across
+            // `assert`s; a stale entry after `pop` only makes
+            // `eager_table_index_case_split` re-emit a *valid* (redundant)
+            // covering case-split, so it is sound to leave it (cleared only by
+            // `reset`).
+            table_index_domain_eqs: _, // accumulates domain case-split equalities;
+            // a stale entry only makes `link_table_index_comparisons` re-link a
+            // *valid* (redundant) implication, so it is sound to leave it
+            // (cleared only by `reset`).
             dt_var_constructors: _,      // TRAIL: DtVarConstructorAdded
             arith_parse_cache: _,        // INVARIANT: keyed by term structure
             tracked_compound_terms: _,   // TRAIL: TrackedCompoundAdded

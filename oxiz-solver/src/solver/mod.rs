@@ -15,6 +15,7 @@ pub(super) mod dt_axioms;
 pub(super) mod encode;
 pub(super) mod encode_guards;
 pub(super) mod int_case_split;
+pub(super) mod ite_table;
 pub(super) mod model_builder;
 pub(super) mod model_eval;
 pub(super) mod pigeonhole;
@@ -154,6 +155,15 @@ pub struct Solver {
     pub(super) ite_result_terms: FxHashSet<TermId>,
     /// Care-graph split pairs for trailed dedup.
     pub(super) care_split_pairs: FxHashSet<(TermId, TermId)>,
+    /// Index terms of equality-`ite` lookup tables flattened by
+    /// [`Solver::flatten_eq_ite_tables`].  Used for eager finite-domain case
+    /// splits so CDCL pins `(= idx k)` and table covering clauses unit-propagate.
+    pub(super) table_index_terms: FxHashSet<TermId>,
+    /// Domain case-split equalities for table indices: `idx → [(k, lit(= idx k))]`
+    /// in ascending `k` order.  Built by [`Solver::eager_table_index_case_split`]
+    /// and used to boolean-link comparison atoms (`>`, `>=`, …) so nested ite
+    /// guards like `(> j0 0)` unit-propagate once a domain value is chosen.
+    pub(super) table_index_domain_eqs: FxHashMap<TermId, Vec<(i64, oxiz_sat::Lit)>>,
     /// Datatype constructor constraints: variable -> constructor name
     /// Used to detect mutual exclusivity conflicts (var = C1 AND var = C2 where C1 != C2)
     pub(super) dt_var_constructors: FxHashMap<TermId, oxiz_core::interner::Spur>,
@@ -408,6 +418,8 @@ impl Solver {
             arith_terms: FxHashSet::default(),
             ite_result_terms: FxHashSet::default(),
             care_split_pairs: FxHashSet::default(),
+            table_index_terms: FxHashSet::default(),
+            table_index_domain_eqs: FxHashMap::default(),
             dt_var_constructors: FxHashMap::default(),
             arith_parse_cache: FxHashMap::default(),
             tracked_compound_terms: FxHashSet::default(),
@@ -877,6 +889,16 @@ impl Solver {
         // Must run after all assertions are encoded so the arith term set is
         // complete.
         self.axiomatize_arith_constant_equalities(manager);
+
+        // Eager finite-domain splits on equality-ite table indices (0..N with
+        // N small).  Gives CDCL concrete `(= idx k)` atoms so flattened table
+        // covering clauses unit-propagate — critical for tool-generated QF_LIA
+        // lookup problems where the first SAT model otherwise disagrees with
+        // arithmetic and trips the model-refutation honesty gate.
+        self.eager_table_index_case_split(manager);
+        // Connect `(> idx c)` / … atoms to domain equalities so nested ite
+        // guards on indices fire by unit propagation once CDCL picks `idx`.
+        self.link_table_index_comparisons(manager);
 
         // Theory-aware decision hint: prioritize finite-domain value atoms.
         self.bump_finite_domain_enumerations(manager);
@@ -2049,6 +2071,8 @@ impl Solver {
         self.arith_terms.clear();
         self.ite_result_terms.clear();
         self.care_split_pairs.clear();
+        self.table_index_terms.clear();
+        self.table_index_domain_eqs.clear();
         self.dt_var_constructors.clear();
         self.arith_parse_cache.clear();
         self.tracked_compound_terms.clear();

@@ -173,6 +173,10 @@ impl Solver {
                 let eq = manager.mk_eq(term, int_k);
                 lits.push(self.encode_depth(eq, manager, 0));
             }
+            // At-least-one only.  Pairwise at-most-one here regresses WiSA-style
+            // QF_UFLIA (extra binary clauses disrupt CDCL without helping UF
+            // congruence).  Table-index splits add at-most-one separately in
+            // `eager_table_index_case_split` where covering-OR unit-prop needs it.
             self.sat.add_clause(lits);
             self.case_split_terms.insert(term);
         }
