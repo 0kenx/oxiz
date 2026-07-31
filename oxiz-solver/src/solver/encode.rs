@@ -496,6 +496,10 @@ impl Solver {
     /// `Solver::invalidate_results` (private) for the rule and for why the unsat
     /// core goes with it.
     pub fn assert(&mut self, term: TermId, manager: &mut TermManager) {
+        // Eliminate non-Bool `ite` (mux) subterms into fresh constants plus
+        // conditional side-conditions, so EUF sees the selected-branch equality
+        // in every position (direct equality operand, nested in an app arg, …).
+        let term = self.eliminate_nonbool_ite(term, manager);
         let index = self.assertions.len();
         self.assertions.push(term);
         self.trail.push(TrailOp::AssertionAdded { index });
@@ -997,6 +1001,67 @@ impl Solver {
         }
     }
 
+    /// Eliminate every non-Bool `ite` from `term`, returning an equivalent term
+    /// with the side-conditions conjoined.
+    ///
+    /// Each non-Bool `(ite c t e)` of sort `s` is replaced everywhere it appears
+    /// by a fresh constant `v` of sort `s`, with two side-conditions conjoined:
+    /// `(=> c (= v t))` and `(=> (not c) (= v e))`. Once encoded, these pin
+    /// `(= v t)` when `c` is true and `(= v e)` when `c` is false, so EUF merges
+    /// the selected branch — recovering the conditional-equality semantics an
+    /// opaque `ite` leaf would lose. Handles `ite` in every position,
+    /// superseding the narrower [`encode_nonbool_ite_equality`] clauses (kept as
+    /// a no-op backstop). Bool-sorted `ite`s are left for the gate encoder. The
+    /// fresh constant is keyed by the `ite`'s `TermId` (hash-consed, so a
+    /// structurally identical `ite` shares one var across assertions).
+    pub(super) fn eliminate_nonbool_ite(
+        &mut self,
+        term: TermId,
+        manager: &mut TermManager,
+    ) -> TermId {
+        use oxiz_core::ast::collect_subterms;
+        use rustc_hash::FxHashMap;
+
+        let bool_sort = manager.sorts.bool_sort;
+        let mut map: FxHashMap<TermId, TermId> = FxHashMap::default();
+        // First pass: assign a fresh var to each non-Bool ite subterm.
+        for st in collect_subterms(term, manager) {
+            let Some(t) = manager.get(st) else {
+                continue;
+            };
+            if matches!(t.kind, TermKind::Ite(..)) && t.sort != bool_sort {
+                let v = manager.mk_var(&format!("__oxiz_ite_{}", st.0), t.sort);
+                map.insert(st, v);
+            }
+        }
+        if map.is_empty() {
+            return term;
+        }
+        // Second pass: build side-conditions with inner ites already substituted.
+        let mut side: Vec<TermId> = Vec::with_capacity(map.len() * 2);
+        for (ite_term, v) in &map {
+            let Some(t) = manager.get(*ite_term) else {
+                continue;
+            };
+            let TermKind::Ite(c, tb, eb) = &t.kind else {
+                continue;
+            };
+            let (c, tb, eb) = (*c, *tb, *eb);
+            let c_sub = manager.substitute(c, &map);
+            let t_sub = manager.substitute(tb, &map);
+            let e_sub = manager.substitute(eb, &map);
+            let eq_v_t = manager.mk_eq(*v, t_sub);
+            let eq_v_e = manager.mk_eq(*v, e_sub);
+            let not_c = manager.mk_not(c_sub);
+            side.push(manager.mk_implies(c_sub, eq_v_t));
+            side.push(manager.mk_implies(not_c, eq_v_e));
+        }
+        let rewritten = manager.substitute(term, &map);
+        let mut parts = side;
+        parts.insert(0, rewritten);
+        manager.mk_and(parts)
+    }
+
     /// literal for the sub-term.  The truncated encoding is deliberately
     /// incomplete: `check` observes the flag and answers `Unknown` rather than
     /// crashing the process with a stack overflow or trusting a partial model.
@@ -1068,6 +1133,15 @@ impl Solver {
             }
             TermKind::Var(_) => {
                 let var = self.get_or_create_var(term);
+                // Bool completion: register Bool-sorted variables so EUF merges
+                // them with the canonical true/false node by SAT value. Two Bool
+                // variables with the same value ARE equal (Bool has two values),
+                // and this is what lets congruence fire over UF applications that
+                // take Bool arguments. Without it, distinct-but-equal Bool terms
+                // stay in separate classes and f(b1)=f(b2) is never derived.
+                if t.sort == manager.sorts.bool_sort {
+                    self.record_constraint(var, Constraint::BoolApp(term));
+                }
                 // Track theory terms for model extraction
                 let is_int = t.sort == manager.sorts.int_sort;
                 let is_real = t.sort == manager.sorts.real_sort;
