@@ -1225,6 +1225,21 @@ impl Solver {
                     self.sat
                         .add_clause([lhs_lit.negate(), rhs_lit.negate(), result]);
 
+                    // ALSO register this equality as a theory constraint so EUF
+                    // learns `lhs = rhs` and propagates congruence to Bool-sorted
+                    // function applications. The iff gate handles pure-boolean
+                    // propagation but cannot express congruence: `a = a'` (a Bool
+                    // equality) must force `f(a) = f(a')` for a Bool-returning f.
+                    // Without this EUF never merges the operands, that congruence
+                    // is lost, and QF_UF problems over Bool-sorted UF go false-SAT.
+                    // Both the iff gate and the theory constraint are sound and
+                    // complementary: when `result` is true the iff clauses force
+                    // equal SAT values *and* EUF merges them; when false EUF
+                    // records the disequality.
+                    self.record_constraint(result_var, Constraint::Eq(*lhs, *rhs));
+                    self.track_theory_vars(*lhs, manager);
+                    self.track_theory_vars(*rhs, manager);
+
                     result
                 } else {
                     // Theory equality: create a fresh boolean variable
