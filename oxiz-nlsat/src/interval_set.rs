@@ -270,55 +270,125 @@ impl IntervalSet {
 
     /// Get a sample point from the interval set (if non-empty).
     pub fn sample(&self) -> Option<BigRational> {
+        self.sample_excluding(&[])
+    }
+
+    /// Sample a point from this set that is not in `tried`.
+    ///
+    /// Prefer small integers (critical for NIA branch-and-bound and for
+    /// multivariate product equalities like `x*y = 12`, where the greedy
+    /// default of `0` makes every subsequent cell empty). Bounded components
+    /// are enumerated exhaustively up to a cap; unbounded ones try a growing
+    /// ring of integer magnitudes, then fall back to midpoints.
+    pub fn sample_excluding(&self, tried: &[BigRational]) -> Option<BigRational> {
         if self.is_empty() {
             return None;
         }
 
-        // Try to find a nice point (preferably an integer)
-        for interval in &self.intervals {
-            if let Some(mid) = interval.midpoint() {
-                // Round to nearest integer if possible
-                let floor = mid.floor();
-                let ceil = mid.ceil();
+        let is_fresh = |v: &BigRational| !tried.iter().any(|t| t == v);
 
-                if interval.contains(&floor) {
-                    return Some(floor);
+        // 1. Integers inside finite (bounded) components — complete for NIA boxes.
+        const MAX_INT_ENUM: i64 = 512;
+        for interval in &self.intervals {
+            if let (Bound::Finite(lo), Bound::Finite(hi)) = (&interval.lo, &interval.hi) {
+                let mut k = lo.ceil();
+                let end = hi.floor();
+                let mut steps = 0i64;
+                while k <= end && steps < MAX_INT_ENUM {
+                    if interval.contains(&k) && is_fresh(&k) {
+                        return Some(k);
+                    }
+                    k += BigRational::one();
+                    steps += 1;
                 }
-                if interval.contains(&ceil) {
-                    return Some(ceil);
-                }
-                return Some(mid);
             }
         }
 
-        // Handle unbounded intervals
+        // 2. Small integers in any component (covers rays and the full line).
+        //    Prefer nonzero early: zero degenerates product constraints.
+        if self.contains_zero() && is_fresh(&BigRational::zero()) && tried.is_empty() {
+            // Only take 0 on the first attempt for a cell; after a failure the
+            // caller will come back with tried=[0] and skip this arm.
+        }
+        for mag in 0i64..64 {
+            for &sgn in &[1i64, -1i64] {
+                if mag == 0 && sgn < 0 {
+                    continue;
+                }
+                let v = BigRational::from_integer((sgn * mag).into());
+                if self.contains(&v) && is_fresh(&v) {
+                    // Defer 0 until after ±1..±3 when the set is the whole line
+                    // or a large ray, so product cells get a non-degenerate start.
+                    if v.is_zero() && tried.is_empty() && self.has_unbounded_component() {
+                        continue;
+                    }
+                    return Some(v);
+                }
+            }
+        }
+        // 0 was deferred above for unbounded sets.
+        if self.contains_zero() && is_fresh(&BigRational::zero()) {
+            return Some(BigRational::zero());
+        }
+
+        // 3. Midpoints of finite components.
         for interval in &self.intervals {
-            // If unbounded below, try 0 or a negative integer
+            if let Some(mid) = interval.midpoint() {
+                let floor = mid.floor();
+                let ceil = mid.ceil();
+                if interval.contains(&floor) && is_fresh(&floor) {
+                    return Some(floor);
+                }
+                if interval.contains(&ceil) && is_fresh(&ceil) {
+                    return Some(ceil);
+                }
+                if is_fresh(&mid) {
+                    return Some(mid);
+                }
+            }
+        }
+
+        // 4. Unbounded endpoints: step off the finite side.
+        for interval in &self.intervals {
             if interval.lo.is_neg_inf()
                 && let Bound::Finite(hi) = &interval.hi
             {
                 let val = hi.floor() - BigRational::one();
-                if interval.contains(&val) {
+                if interval.contains(&val) && is_fresh(&val) {
                     return Some(val);
                 }
             }
-            // If unbounded above, try 0 or a positive integer
             if interval.hi.is_pos_inf()
                 && let Bound::Finite(lo) = &interval.lo
             {
                 let val = lo.ceil() + BigRational::one();
-                if interval.contains(&val) {
+                if interval.contains(&val) && is_fresh(&val) {
                     return Some(val);
                 }
             }
         }
 
-        // Just return 0 if it's in the set
-        if self.contains_zero() {
-            return Some(BigRational::zero());
-        }
-
         None
+    }
+
+    fn has_unbounded_component(&self) -> bool {
+        self.intervals
+            .iter()
+            .any(|i| i.lo.is_neg_inf() || i.hi.is_pos_inf())
+    }
+
+    /// If this set is exactly one closed singleton `{v}`, return `v`.
+    pub fn as_singleton(&self) -> Option<BigRational> {
+        if self.intervals.len() != 1 {
+            return None;
+        }
+        let i = &self.intervals[0];
+        match (&i.lo, &i.hi) {
+            (Bound::Finite(lo), Bound::Finite(hi)) if lo == hi && !i.lo_open && !i.hi_open => {
+                Some(lo.clone())
+            }
+            _ => None,
+        }
     }
 
     /// Get all finite endpoints in the interval set.

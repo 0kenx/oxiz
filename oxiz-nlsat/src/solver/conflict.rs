@@ -350,6 +350,8 @@ impl NlsatSolver {
             self.assignment.unset_arith(var);
             self.assignment.reset_feasible(var);
         }
+        // Greedy arithmetic samples are invalidated with the boolean level.
+        self.arith_trail.clear();
 
         // Clear evaluation cache
         self.eval_cache.clear();

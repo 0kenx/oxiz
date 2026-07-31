@@ -147,3 +147,70 @@ fn independent_signs_stay_sat() {
         "x>0 ∧ y<0 is satisfiable"
     );
 }
+
+/// Bare product equality must not collapse to Unsat via a greedy `x = 0` sample.
+#[test]
+fn bare_product_equality_is_sat() {
+    let mut solver = NlsatSolver::new();
+    let a = solver.new_ineq_atom(xy_minus(12), AtomKind::Eq);
+    solver.add_clause(vec![solver.atom_literal(a, true)]);
+    assert_eq!(
+        solver.solve(),
+        SolverResult::Sat,
+        "x*y = 12 is satisfiable over the reals"
+    );
+}
+
+/// Magnitude product conflict: x>1 ∧ y>1 ∧ x·y = 1.
+#[test]
+fn product_bound_conflict_is_unsat() {
+    let mut solver = NlsatSolver::new();
+    let a1 = solver.new_ineq_atom(x_minus(1), AtomKind::Gt);
+    let a2 = solver.new_ineq_atom(Polynomial::sub(&y(), &cst(1)), AtomKind::Gt);
+    let a3 = solver.new_ineq_atom(xy_minus(1), AtomKind::Eq);
+    solver.add_clause(vec![solver.atom_literal(a1, true)]);
+    solver.add_clause(vec![solver.atom_literal(a2, true)]);
+    solver.add_clause(vec![solver.atom_literal(a3, true)]);
+    assert_eq!(
+        solver.solve(),
+        SolverResult::Unsat,
+        "x>1 ∧ y>1 ∧ x*y=1 is UNSAT"
+    );
+}
+
+/// Linear sum bound conflict: x>5 ∧ y>5 ∧ x+y<5.
+#[test]
+fn linear_sum_bound_conflict_is_unsat() {
+    let mut solver = NlsatSolver::new();
+    let a1 = solver.new_ineq_atom(x_minus(5), AtomKind::Gt);
+    let a2 = solver.new_ineq_atom(Polynomial::sub(&y(), &cst(5)), AtomKind::Gt);
+    let sum = Polynomial::sub(&Polynomial::add(&x(), &y()), &cst(5));
+    let a3 = solver.new_ineq_atom(sum, AtomKind::Lt);
+    solver.add_clause(vec![solver.atom_literal(a1, true)]);
+    solver.add_clause(vec![solver.atom_literal(a2, true)]);
+    solver.add_clause(vec![solver.atom_literal(a3, true)]);
+    assert_eq!(
+        solver.solve(),
+        SolverResult::Unsat,
+        "x>5 ∧ y>5 ∧ x+y<5 is UNSAT"
+    );
+}
+
+/// Forced singleton + circle: x=2 ∧ x²+y²=1 is UNSAT.
+#[test]
+fn forced_point_outside_circle_is_unsat() {
+    let mut solver = NlsatSolver::new();
+    let circle = Polynomial::sub(
+        &Polynomial::add(&Polynomial::mul(&x(), &x()), &Polynomial::mul(&y(), &y())),
+        &cst(1),
+    );
+    let a1 = solver.new_ineq_atom(circle, AtomKind::Eq);
+    let a2 = solver.new_ineq_atom(x_minus(2), AtomKind::Eq);
+    solver.add_clause(vec![solver.atom_literal(a1, true)]);
+    solver.add_clause(vec![solver.atom_literal(a2, true)]);
+    assert_eq!(
+        solver.solve(),
+        SolverResult::Unsat,
+        "x=2 ∧ x²+y²=1 is UNSAT"
+    );
+}

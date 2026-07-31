@@ -116,6 +116,27 @@ pub struct SolverStats {
     pub inprocess_passes: u64,
 }
 
+/// One greedy arithmetic assignment that can be re-sampled on cell failure.
+///
+/// NLSAT assigns arithmetic variables to rational sample points. When a later
+/// variable's cell is empty (or only algebraic) under that choice, the search
+/// must undo the earlier sample and try another point from the same feasible
+/// region — treating level-0 cell failure as global `Unsat` is unsound
+/// (e.g. bare `x*y = 12` with the default sample `x = 0`).
+#[derive(Debug, Clone)]
+pub(super) struct ArithTrailFrame {
+    /// Variable that was assigned.
+    pub(super) var: Var,
+    /// Feasible rational region at the time of the decision (`inner`).
+    pub(super) region: crate::interval_set::IntervalSet,
+    /// Sample points already tried for this variable at this stack depth.
+    pub(super) tried: Vec<BigRational>,
+    /// True when `region` was a singleton — the value was forced by the
+    /// boolean atom assignment, not a free greedy choice. Needed so a later
+    /// empty cell can be promoted to a valid boolean theory lemma.
+    pub(super) forced: bool,
+}
+
 /// Non-linear arithmetic solver using CAD.
 pub struct NlsatSolver {
     /// Solver configuration.
@@ -196,6 +217,11 @@ pub struct NlsatSolver {
     pub(super) searched: bool,
     /// Whether an explicit empty (false) clause has been added.
     pub(super) has_empty_clause: bool,
+    /// Stack of greedy arithmetic sample decisions (see [`ArithTrailFrame`]).
+    pub(super) arith_trail: Vec<ArithTrailFrame>,
+    /// Cap on arithmetic re-samples across the whole search (prevents
+    /// unbounded enumeration on infinite cells).
+    pub(super) arith_resample_budget: u32,
 }
 
 impl NlsatSolver {
@@ -245,6 +271,8 @@ impl NlsatSolver {
             saved_phase: Vec::new(),
             searched: false,
             has_empty_clause: false,
+            arith_trail: Vec::new(),
+            arith_resample_budget: 10_000,
         }
     }
 
@@ -591,6 +619,8 @@ impl NlsatSolver {
         self.propagation_queue.clear();
         self.eval_cache.clear();
         self.conflict_clause = None;
+        self.arith_trail.clear();
+        self.arith_resample_budget = 10_000;
 
         // Re-derive the level-0 unit assignments from every unit clause. Learned
         // clauses are entailed by the originals, so replaying their units is
@@ -813,7 +843,7 @@ impl NlsatSolver {
             if let Some(var) = self.next_arith_var() {
                 match self.pick_arith_value(var) {
                     ArithDecision::Value(value) => {
-                        self.assignment.set_arith(var, value);
+                        self.commit_arith_sample(var, value);
                         // New propagations may follow the arithmetic assignment.
                         continue;
                     }
@@ -831,20 +861,15 @@ impl NlsatSolver {
                         self.install_theory_conflict(lemma);
                         continue;
                     }
-                    ArithDecision::IrrationalOnly => {
-                        // A real (algebraic) solution exists but has no rational
-                        // representation in the current model: report Unknown
-                        // rather than a fabricated model or a wrong Unsat.
-                        return SolverResult::Unknown;
-                    }
-                    ArithDecision::GreedyEmpty => {
-                        if self.assignment.level() == 0 {
-                            // Fully-forced infeasible arithmetic state.
-                            return SolverResult::Unsat;
+                    ArithDecision::IrrationalOnly | ArithDecision::GreedyEmpty => {
+                        // Cell failure under the current greedy samples: undo
+                        // the latest arithmetic choice and try another point.
+                        // Never promote this to global Unsat — emptiness is
+                        // conditional on earlier free samples (bare `x*y=12`
+                        // with `x=0` is the canonical false-Unsat).
+                        if self.resample_previous_arith() {
+                            continue;
                         }
-                        // Emptiness is conditional on earlier greedy choices and
-                        // cannot be certified as a variable-local lemma; report
-                        // Unknown instead of looping on the same decision.
                         return SolverResult::Unknown;
                     }
                 }

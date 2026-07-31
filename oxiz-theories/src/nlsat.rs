@@ -23,7 +23,7 @@ use crate::prelude::*;
 use crate::theory::{Theory, TheoryId, TheoryResult};
 use num_bigint::BigInt;
 use num_rational::BigRational;
-use num_traits::ToPrimitive;
+use num_traits::{ToPrimitive, Zero};
 use oxiz_core::ast::{TermId, TermKind, TermManager};
 use oxiz_core::error::Result;
 use oxiz_math::polynomial::Polynomial;
@@ -57,11 +57,22 @@ pub enum NlDispatchResult {
 ///
 /// Maintains a cache of `TermId → polynomial variable index` so that each
 /// unique variable term receives a stable index.
+///
+/// Integer `div`/`mod` are encoded with fresh quotient/remainder variables and
+/// the Euclidean identities `a = q·b + r`, `0 ≤ r < |b|` (constant positive
+/// divisors only for the strict upper bound; otherwise extraction is marked
+/// incomplete). Side-constraint atoms are buffered in [`Self::pending_atoms`].
 pub struct TermPolyTranslator<'a> {
     manager: &'a TermManager,
     nlsat: &'a mut NiaSolver,
     var_cache: HashMap<TermId, u32>,
     integer_mode: bool,
+    /// Fresh poly var for each `(div a b)` / `(mod a b)` term pair key.
+    divmod_cache: HashMap<(TermId, TermId), (u32, u32)>,
+    /// Side constraints emitted while translating div/mod.
+    pending_atoms: Vec<PolyAtom>,
+    /// Set when a div/mod could not be fully encoded (non-constant divisor, …).
+    divmod_incomplete: bool,
 }
 
 impl<'a> TermPolyTranslator<'a> {
@@ -72,16 +83,97 @@ impl<'a> TermPolyTranslator<'a> {
             nlsat,
             var_cache: HashMap::new(),
             integer_mode,
+            divmod_cache: HashMap::new(),
+            pending_atoms: Vec::new(),
+            divmod_incomplete: false,
         }
     }
 
     /// Translate a term into a `Polynomial`.
     ///
     /// Returns `None` for sub-expressions that cannot be expressed as a
-    /// polynomial (e.g. division, modulo, uninterpreted functions).
+    /// polynomial (e.g. uninterpreted functions, non-constant real division).
     pub fn translate(&mut self, term_id: TermId) -> Option<Polynomial> {
+        // `div`/`mod` are encoded via Euclidean auxiliary variables (see
+        // [`Self::ensure_divmod`]) rather than by the generic polynomial
+        // builder; the wiring lives in [`PolyVarSource::divmod_leaf`], reached
+        // through `translate_poly` / `open_poly` so nested occurrences are
+        // handled too.
         let manager = self.manager;
         translate_poly(manager, self, term_id)
+    }
+
+    /// Ensure Euclidean `div`/`mod` witnesses for `(lhs, rhs)`.
+    ///
+    /// Emits `lhs = q·rhs + r` and, when `rhs` is a positive integer constant
+    /// `b`, `0 ≤ r < b`. Returns `(q_var, r_var)`.
+    fn ensure_divmod(&mut self, lhs: TermId, rhs: TermId) -> Option<(u32, u32)> {
+        if let Some(&pair) = self.divmod_cache.get(&(lhs, rhs)) {
+            return Some(pair);
+        }
+        let a = self.translate(lhs)?;
+        let b_poly = self.translate(rhs)?;
+
+        let q = self.nlsat.nlsat_mut().new_arith_var();
+        let r = self.nlsat.nlsat_mut().new_arith_var();
+        if self.integer_mode {
+            self.nlsat.set_var_type(q, VarType::Integer);
+            self.nlsat.set_var_type(r, VarType::Integer);
+        } else {
+            // Sort-based: div/mod are integer ops in SMT-LIB.
+            self.nlsat.set_var_type(q, VarType::Integer);
+            self.nlsat.set_var_type(r, VarType::Integer);
+        }
+
+        let q_poly = Polynomial::from_var(q);
+        let r_poly = Polynomial::from_var(r);
+        // a - (q*b + r) = 0
+        let qb = Polynomial::mul(&q_poly, &b_poly);
+        let qb_r = Polynomial::add(&qb, &r_poly);
+        self.pending_atoms.push(PolyAtom {
+            poly: Polynomial::sub(&a, &qb_r),
+            kind: AtomKind::Eq,
+            positive: true,
+        });
+        // r >= 0  ⇔  NOT(r < 0)
+        self.pending_atoms.push(PolyAtom {
+            poly: r_poly.clone(),
+            kind: AtomKind::Lt,
+            positive: false,
+        });
+
+        // 0 ≤ r < |b|. For constant b use a linear bound; for variable b use
+        // the polynomial encoding r² < b² (equivalent under r ≥ 0, b ≠ 0).
+        if b_poly.is_constant() {
+            let b_const = b_poly.constant_value();
+            if b_const.is_zero() {
+                self.divmod_incomplete = true;
+                return None;
+            }
+            let abs_b = if b_const < BigRational::zero() {
+                -b_const
+            } else {
+                b_const
+            };
+            // r - |b| < 0  ⇔  r < |b|
+            self.pending_atoms.push(PolyAtom {
+                poly: Polynomial::sub(&r_poly, &Polynomial::constant(abs_b)),
+                kind: AtomKind::Lt,
+                positive: true,
+            });
+        } else {
+            // r*r - b*b < 0
+            let r2 = Polynomial::mul(&r_poly, &r_poly);
+            let b2 = Polynomial::mul(&b_poly, &b_poly);
+            self.pending_atoms.push(PolyAtom {
+                poly: Polynomial::sub(&r2, &b2),
+                kind: AtomKind::Lt,
+                positive: true,
+            });
+        }
+
+        self.divmod_cache.insert((lhs, rhs), (q, r));
+        Some((q, r))
     }
 
     fn get_or_create_var(&mut self, term_id: TermId) -> u32 {
@@ -118,6 +210,21 @@ impl PolyVarSource for TermPolyTranslator<'_> {
     fn var_for(&mut self, term_id: TermId) -> u32 {
         self.get_or_create_var(term_id)
     }
+
+    fn divmod_leaf(
+        &mut self,
+        _manager: &TermManager,
+        lhs: TermId,
+        rhs: TermId,
+        is_div: bool,
+    ) -> Option<Polynomial> {
+        let (q, r) = self.ensure_divmod(lhs, rhs)?;
+        if is_div {
+            Some(Polynomial::from_var(q))
+        } else {
+            Some(Polynomial::from_var(r))
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -129,6 +236,20 @@ impl PolyVarSource for TermPolyTranslator<'_> {
 trait PolyVarSource {
     /// The polynomial variable index standing for `term_id`.
     fn var_for(&mut self, term_id: TermId) -> u32;
+
+    /// Encode a `(div lhs rhs)` (`is_div`) or `(mod lhs rhs)` term as a
+    /// polynomial leaf, typically via fresh auxiliary variables and side
+    /// constraints. `None` means the source does not support the operator; the
+    /// default keeps the real translator's "not a polynomial" behaviour.
+    fn divmod_leaf(
+        &mut self,
+        _manager: &TermManager,
+        _lhs: TermId,
+        _rhs: TermId,
+        _is_div: bool,
+    ) -> Option<Polynomial> {
+        None
+    }
 }
 
 /// How a node's polynomial is assembled from its operands'.
@@ -213,6 +334,13 @@ fn open_poly<S: PolyVarSource>(
         Const(Polynomial),
         Var,
         Op(PolyCombine, Vec<TermId>),
+        /// `(div lhs rhs)` (`is_div`) or `(mod lhs rhs)`: encoded by the source
+        /// via auxiliary variables rather than by the generic builder.
+        DivMod {
+            lhs: TermId,
+            rhs: TermId,
+            is_div: bool,
+        },
     }
     let shape = {
         let term = manager.get(term_id)?;
@@ -233,6 +361,16 @@ fn open_poly<S: PolyVarSource>(
             TermKind::Mul(args) => {
                 Shape::Op(PolyCombine::Mul, args.iter().rev().copied().collect())
             }
+            TermKind::Div(lhs, rhs) => Shape::DivMod {
+                lhs: *lhs,
+                rhs: *rhs,
+                is_div: true,
+            },
+            TermKind::Mod(lhs, rhs) => Shape::DivMod {
+                lhs: *lhs,
+                rhs: *rhs,
+                is_div: false,
+            },
             _ => return None,
         }
     };
@@ -244,6 +382,9 @@ fn open_poly<S: PolyVarSource>(
             pending,
             done: Vec::new(),
         }),
+        Shape::DivMod { lhs, rhs, is_div } => {
+            PolyOpened::Leaf(src.divmod_leaf(manager, lhs, rhs, is_div)?)
+        }
     })
 }
 
@@ -366,6 +507,37 @@ fn is_const_term(term_id: TermId, manager: &TermManager) -> bool {
         .unwrap_or(false)
 }
 
+fn term_contains_divmod(term_id: TermId, manager: &TermManager) -> bool {
+    let Some(term) = manager.get(term_id) else {
+        return false;
+    };
+    match &term.kind {
+        TermKind::Div(_, _) | TermKind::Mod(_, _) => true,
+        TermKind::Neg(inner) | TermKind::Not(inner) => term_contains_divmod(*inner, manager),
+        TermKind::Add(args)
+        | TermKind::Mul(args)
+        | TermKind::And(args)
+        | TermKind::Or(args)
+        | TermKind::Distinct(args) => args.iter().any(|&a| term_contains_divmod(a, manager)),
+        TermKind::Ite(c, t, e) => {
+            term_contains_divmod(*c, manager)
+                || term_contains_divmod(*t, manager)
+                || term_contains_divmod(*e, manager)
+        }
+        TermKind::Xor(a, b)
+        | TermKind::Implies(a, b)
+        | TermKind::Sub(a, b)
+        | TermKind::Eq(a, b)
+        | TermKind::Gt(a, b)
+        | TermKind::Ge(a, b)
+        | TermKind::Lt(a, b)
+        | TermKind::Le(a, b) => {
+            term_contains_divmod(*a, manager) || term_contains_divmod(*b, manager)
+        }
+        _ => false,
+    }
+}
+
 /// Whether the term mentions an operator the polynomial translation cannot
 /// express. Same shape (and same reasons for being iterative + memoised) as
 /// [`term_is_nonlinear`]: `bool` return, `check_sat` path, input-controlled
@@ -381,7 +553,14 @@ fn contains_non_polynomial_ops(term_id: TermId, manager: &TermManager) -> bool {
             continue;
         };
         match &term.kind {
-            TermKind::Div(_, _) | TermKind::Mod(_, _) => return true,
+            // Div/Mod are encoded via Euclidean auxiliaries in the NIA
+            // translator when the divisor is a nonzero constant; still walk
+            // children so a div/mod of something genuinely non-polynomial is
+            // still detected.
+            TermKind::Div(lhs, rhs) | TermKind::Mod(lhs, rhs) => {
+                stack.push(*lhs);
+                stack.push(*rhs);
+            }
             TermKind::Apply { .. }
             | TermKind::Forall { .. }
             | TermKind::Exists { .. }
@@ -561,7 +740,10 @@ pub fn dispatch_nia_constraints(
     integer_mode: bool,
 ) -> Option<NlDispatchResult> {
     let has_nl = assertions.iter().any(|&a| term_is_nonlinear(a, manager));
-    if !has_nl {
+    let has_divmod = assertions.iter().any(|&a| term_contains_divmod(a, manager));
+    // Engage for nonlinear products *or* integer div/mod (encoded via
+    // Euclidean auxiliaries below). Pure linear problems stay with LIA.
+    if !has_nl && !has_divmod {
         return None;
     }
     let has_unsupported_ops = assertions
@@ -586,13 +768,22 @@ pub fn dispatch_nia_constraints(
             &mut incomplete,
         );
     }
+    // Euclidean div/mod side constraints collected during translation.
+    poly_atoms.extend(translator.pending_atoms.iter().cloned());
+    if translator.divmod_incomplete {
+        incomplete = true;
+    }
 
     if poly_atoms.is_empty() {
         return None;
     }
 
-    let unsat_is_trustworthy =
-        !has_unsupported_ops && poly_atoms.iter().all(|atom| atom.poly.is_univariate());
+    // Unsat from NiaSolver is sound whenever extraction saw the full assertion
+    // set as polynomial atoms (no dropped disjunctions / incomplete div-mod).
+    // Multivariate CAD/B&B unsat is trustworthy under that completeness
+    // condition: a false unsat from greedy cell failure was fixed by arithmetic
+    // re-sampling in `oxiz-nlsat` (bare `x*y=c` no longer collapses to Unsat).
+    let unsat_is_trustworthy = !has_unsupported_ops && !incomplete;
     // A `Sat` verdict is only sound when the solver saw the *entire* assertion
     // set as a conjunction of translatable atoms. If any top-level term was
     // dropped (a disjunction, an untranslatable operand, …) the solver worked

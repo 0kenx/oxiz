@@ -136,6 +136,61 @@ impl NlsatSolver {
             .copied()
     }
 
+    /// Commit a rational sample for `var`, recording it on the arithmetic trail
+    /// so a later cell failure can re-sample this variable.
+    pub(super) fn commit_arith_sample(&mut self, var: Var, value: BigRational) {
+        let regions = self.compute_arith_regions(var);
+        let forced = regions.inner.as_singleton().is_some();
+        if let Some(frame) = self.arith_trail.last_mut()
+            && frame.var == var
+        {
+            if !frame.tried.iter().any(|t| t == &value) {
+                frame.tried.push(value.clone());
+            }
+            self.assignment.set_arith(var, value);
+            self.eval_cache.clear();
+            return;
+        }
+        self.arith_trail.push(super::ArithTrailFrame {
+            var,
+            region: regions.inner,
+            tried: vec![value.clone()],
+            forced,
+        });
+        self.assignment.set_arith(var, value);
+        self.eval_cache.clear();
+    }
+
+    /// Undo the latest greedy arithmetic sample and try another point from the
+    /// same feasible region. Returns `true` if a fresh sample was committed.
+    ///
+    /// Walks up the arithmetic trail when a frame's region is exhausted. Does
+    /// **not** report global unsat: running out of rational samples is
+    /// incompleteness, not a proof.
+    pub(super) fn resample_previous_arith(&mut self) -> bool {
+        while !self.arith_trail.is_empty() {
+            if self.arith_resample_budget == 0 {
+                return false;
+            }
+            let frame = self.arith_trail.last_mut().expect("trail non-empty");
+            let var = frame.var;
+            self.assignment.unset_arith(var);
+            // Also drop any later arith assignments not on the trail (none
+            // expected) and clear dependent theory state.
+            self.eval_cache.clear();
+
+            if let Some(next) = frame.region.sample_excluding(&frame.tried) {
+                self.arith_resample_budget -= 1;
+                frame.tried.push(next.clone());
+                self.assignment.set_arith(var, next);
+                return true;
+            }
+            // This cell is exhausted — pop and try the parent sample.
+            self.arith_trail.pop();
+        }
+        false
+    }
+
     /// Pick a value for an arithmetic variable.
     ///
     /// Returns an [`ArithDecision`] that distinguishes a concrete rational
@@ -147,8 +202,10 @@ impl NlsatSolver {
 
         // A rational witness inside `inner` satisfies every intersected
         // constraint by construction, so it is always safe to commit to it.
+        // Prefer integers / non-zero samples so multivariate products do not
+        // degenerate on the first greedy choice (see `IntervalSet::sample_excluding`).
         if !regions.inner.is_empty()
-            && let Some(value) = regions.inner.sample()
+            && let Some(value) = regions.inner.sample_excluding(&[])
         {
             return ArithDecision::Value(value);
         }
@@ -158,12 +215,25 @@ impl NlsatSolver {
         }
 
         // No rational witness. Classify the emptiness.
-        if regions.pure && regions.reliable {
-            if regions.outer.is_empty() {
+        if regions.reliable && regions.outer.is_empty() {
+            if regions.pure {
                 // The pure single-variable constraints are jointly infeasible
                 // over the reals: `¬l_1 ∨ … ∨ ¬l_k` is a valid theory lemma.
                 return ArithDecision::ProvedEmpty(regions.blame);
             }
+            // Coupled constraints substituted to an empty reliable cell. If
+            // every earlier arithmetic sample was *forced* (singleton region),
+            // the boolean atom assignment alone is theory-unsat and the
+            // negation of all assigned theory literals is a valid lemma
+            // (e.g. `x=2 ∧ x²+y²=1`). Free greedy samples must not be blamed.
+            if !regions.blame.is_empty()
+                && self.arith_trail.iter().all(|f| f.forced)
+                && let Some(lemma) = self.lemma_negating_assigned_theory_lits()
+            {
+                return ArithDecision::ProvedEmpty(lemma);
+            }
+        }
+        if regions.pure && regions.reliable && !regions.outer.is_empty() {
             // Real solutions exist but none are rational (algebraic only).
             return ArithDecision::IrrationalOnly;
         }
@@ -179,8 +249,286 @@ impl NlsatSolver {
         if let Some(lemma) = self.certify_sign_conflict() {
             return ArithDecision::ProvedEmpty(lemma);
         }
+        // Magnitude reasoning for positive-bound product equalities
+        // (e.g. x>1 ∧ y>1 ∧ x·y=1), which pure sign sets cannot refute.
+        if let Some(lemma) = self.certify_product_bound_conflict() {
+            return ArithDecision::ProvedEmpty(lemma);
+        }
+        // Linear sum lower-bound conflict: x>a ∧ y>b ∧ x+y<c with a+b≥c.
+        if let Some(lemma) = self.certify_linear_sum_bound_conflict() {
+            return ArithDecision::ProvedEmpty(lemma);
+        }
 
         ArithDecision::GreedyEmpty
+    }
+
+    /// Negation of every currently assigned inequality-atom literal. Valid as a
+    /// theory lemma only when the arithmetic model is fully forced by those
+    /// atoms (see the `forced` trail flag); callers must check that.
+    fn lemma_negating_assigned_theory_lits(&self) -> Option<Vec<Literal>> {
+        let mut lemma = Vec::new();
+        for atom in &self.atoms {
+            let Atom::Ineq(ineq) = atom else {
+                continue;
+            };
+            let val = self.assignment.bool_value(ineq.bool_var);
+            if val.is_true() {
+                lemma.push(Literal::negative(ineq.bool_var));
+            } else if val.is_false() {
+                lemma.push(Literal::positive(ineq.bool_var));
+            }
+        }
+        if lemma.is_empty() { None } else { Some(lemma) }
+    }
+
+    /// Certify `x > a ∧ y > b ∧ x + y < c` (and non-strict variants) when the
+    /// bounds force `a+b ≥ c` (strictness-adjusted).
+    pub(super) fn certify_linear_sum_bound_conflict(&self) -> Option<Vec<Literal>> {
+        // lowers: var → (bound, strict, lit)
+        let mut lowers: FxHashMap<Var, (BigRational, bool, Literal)> = FxHashMap::default();
+        // upper bounds on sums: (vars, bound, strict, lit) for v1+v2+… < / ≤ bound
+        let mut sum_uppers: Vec<(Vec<Var>, BigRational, bool, Literal)> = Vec::new();
+
+        for atom in &self.atoms {
+            let Atom::Ineq(ineq) = atom else {
+                continue;
+            };
+            if ineq.factors.len() != 1 {
+                continue;
+            }
+            let val = self.assignment.bool_value(ineq.bool_var);
+            if val.is_undef() {
+                continue;
+            }
+            let is_true = val.is_true();
+            let lit = if is_true {
+                Literal::positive(ineq.bool_var)
+            } else {
+                Literal::negative(ineq.bool_var)
+            };
+            let poly = &ineq.factors[0].poly;
+            // Parse linear: sum coeff_i * v_i + const.
+            let mut coeffs: Vec<(Var, BigRational)> = Vec::new();
+            let mut constant = BigRational::zero();
+            let mut linear_ok = true;
+            for term in poly.terms() {
+                if term.monomial.is_unit() {
+                    constant += &term.coeff;
+                } else {
+                    let vars: Vec<_> = term.monomial.vars().iter().collect();
+                    if vars.len() == 1 && vars[0].power == 1 {
+                        coeffs.push((vars[0].var, term.coeff.clone()));
+                    } else {
+                        linear_ok = false;
+                        break;
+                    }
+                }
+            }
+            if !linear_ok || coeffs.is_empty() {
+                continue;
+            }
+
+            if coeffs.len() == 1 {
+                let (v, coeff) = &coeffs[0];
+                if coeff.is_zero() {
+                    continue;
+                }
+                let bound = -&constant / coeff;
+                let (want_lower, strict) = match (ineq.kind, is_true, coeff.is_positive()) {
+                    (AtomKind::Gt, true, true) => (true, true),
+                    (AtomKind::Lt, false, true) => (true, false),
+                    (AtomKind::Lt, true, false) => (true, true),
+                    (AtomKind::Gt, false, false) => (true, false),
+                    _ => continue,
+                };
+                if !want_lower {
+                    continue;
+                }
+                let entry = lowers.entry(*v).or_insert((bound.clone(), strict, lit));
+                if bound > entry.0 || (bound == entry.0 && strict && !entry.1) {
+                    *entry = (bound, strict, lit);
+                }
+            } else if coeffs.iter().all(|(_, c)| *c == BigRational::one()) {
+                // x + y + … OP -const  with unit coeffs.
+                let vars: Vec<Var> = coeffs.iter().map(|(v, _)| *v).collect();
+                let bound = -constant;
+                let (is_upper, strict) = match (ineq.kind, is_true) {
+                    (AtomKind::Lt, true) => (true, true),   // sum < bound
+                    (AtomKind::Gt, false) => (true, false), // sum ≤ bound
+                    _ => continue,
+                };
+                if is_upper {
+                    sum_uppers.push((vars, bound, strict, lit));
+                }
+            }
+        }
+
+        for (vars, ub, ub_strict, ulit) in &sum_uppers {
+            if vars.len() < 2 {
+                continue;
+            }
+            let mut sum_lo = BigRational::zero();
+            let mut any_strict = false;
+            let mut lits: Vec<Literal> = vec![*ulit];
+            let mut ok = true;
+            for v in vars {
+                let Some((b, s, l)) = lowers.get(v) else {
+                    ok = false;
+                    break;
+                };
+                sum_lo += b;
+                any_strict |= *s;
+                lits.push(*l);
+            }
+            if !ok {
+                continue;
+            }
+            // sum > sum_lo (if any strict lower) or sum ≥ sum_lo otherwise.
+            // Conflicts with sum < ub when sum_lo ≥ ub (strict lower or strict upper),
+            // or sum_lo > ub.
+            let unsat = if sum_lo > *ub {
+                true
+            } else if sum_lo == *ub {
+                // equal bounds: conflict if either side is strict
+                any_strict || *ub_strict
+            } else {
+                false
+            };
+            if unsat {
+                let mut lemma: Vec<Literal> = lits.iter().map(|l| l.negate()).collect();
+                lemma.sort_by_key(|l| l.index());
+                lemma.dedup();
+                if lemma.len() >= 2 {
+                    return Some(lemma);
+                }
+            }
+        }
+        None
+    }
+
+    /// Certify unsat of `x·y = c` (or `x·y - c = 0`) together with strict or
+    /// non-strict positive lower bounds on `x` and `y`.
+    ///
+    /// If `x > a ≥ 0`, `y > b ≥ 0` and `c ≤ a·b` (strict bounds), or
+    /// `x ≥ a > 0`, `y ≥ b > 0` and `c < a·b`, then `x·y = c` is impossible
+    /// over the reals. Returns a lemma negating the three participating atoms.
+    pub(super) fn certify_product_bound_conflict(&self) -> Option<Vec<Literal>> {
+        // Collect simple lower bounds: var ↦ (bound, strict, lit).
+        let mut lowers: FxHashMap<Var, (BigRational, bool, Literal)> = FxHashMap::default();
+        // Product equalities: (x, y, c, lit) meaning x*y = c with c > 0.
+        let mut products: Vec<(Var, Var, BigRational, Literal)> = Vec::new();
+
+        for atom in &self.atoms {
+            let Atom::Ineq(ineq) = atom else {
+                continue;
+            };
+            if ineq.factors.len() != 1 {
+                continue;
+            }
+            let val = self.assignment.bool_value(ineq.bool_var);
+            if val.is_undef() {
+                continue;
+            }
+            let is_true = val.is_true();
+            let lit = if is_true {
+                Literal::positive(ineq.bool_var)
+            } else {
+                Literal::negative(ineq.bool_var)
+            };
+            let Some((coeff, vars, constant)) = parse_monomial_plus_const(&ineq.factors[0].poly)
+            else {
+                continue;
+            };
+
+            // Lower bound: ±1 · v + k  with kind giving v ≥/≥ -k/coeff.
+            if vars.len() == 1 && vars[0].1 == 1 {
+                let v = vars[0].0;
+                // poly = coeff*v + constant OP 0 ⇒ coeff*v OP -constant
+                if coeff.is_zero() {
+                    continue;
+                }
+                let bound = -&constant / &coeff;
+                // Effective relation of v against `bound`.
+                let (want_lower, strict) = match (ineq.kind, is_true, coeff.is_positive()) {
+                    // coeff > 0: v OP bound. OP in {>,>=,<,<=,=}
+                    (AtomKind::Gt, true, true) => (true, true), // v > bound
+                    (AtomKind::Lt, false, true) => (true, false), // v >= bound
+                    (AtomKind::Lt, true, false) => (true, true), // -v < -bound ⇒ v > bound
+                    (AtomKind::Gt, false, false) => (true, false), // -v >= -bound ⇒ v <= ... wait
+                    // coeff < 0 flips inequalities:
+                    // coeff*v > t with coeff<0 ⇒ v < t/coeff = bound... not a lower bound.
+                    (AtomKind::Lt, true, true) => (false, true),
+                    (AtomKind::Gt, false, true) => (false, false),
+                    (AtomKind::Gt, true, false) => (false, true), // coeff<0, Gt: v < bound
+                    (AtomKind::Lt, false, false) => (false, false),
+                    _ => continue,
+                };
+                if !want_lower {
+                    continue;
+                }
+                // Keep the strongest lower bound per variable.
+                let entry = lowers.entry(v).or_insert((bound.clone(), strict, lit));
+                let stronger = bound > entry.0 || (bound == entry.0 && strict && !entry.1);
+                if stronger {
+                    *entry = (bound, strict, lit);
+                }
+                continue;
+            }
+
+            // Product equality: c1*x*y + k = 0 with is_true Eq ⇒ x*y = -k/c1.
+            if vars.len() == 2
+                && vars[0].1 == 1
+                && vars[1].1 == 1
+                && matches!((ineq.kind, is_true), (AtomKind::Eq, true))
+            {
+                if coeff.is_zero() {
+                    continue;
+                }
+                let c = -&constant / &coeff;
+                if !c.is_negative() {
+                    products.push((vars[0].0, vars[1].0, c, lit));
+                }
+            }
+        }
+
+        for (x, y, c, prod_lit) in &products {
+            let Some((bx, sx, lx)) = lowers.get(x) else {
+                continue;
+            };
+            let Some((by, sy, ly)) = lowers.get(y) else {
+                continue;
+            };
+            // Need nonnegative lower bounds for the product inequality direction.
+            if bx.is_negative() || by.is_negative() {
+                continue;
+            }
+            let ab = bx * by;
+            let unsat = if c.is_zero() {
+                // x·y = 0 with both factors forced strictly positive (lower
+                // bound ≥ 0 and at least one side strict, or both ≥ with a>0).
+                (*sx || *sy || bx.is_positive() || by.is_positive())
+                    && (*sx || bx.is_positive())
+                    && (*sy || by.is_positive())
+            } else {
+                match (sx, sy) {
+                    // x > a, y > b ⇒ xy > ab; unsat when c ≤ ab
+                    (true, true) => *c <= ab,
+                    // one strict: xy > ab still when the other bound is ≥ 0
+                    (true, false) | (false, true) => *c <= ab,
+                    // both non-strict: xy ≥ ab; unsat when c < ab
+                    (false, false) => *c < ab,
+                }
+            };
+            if unsat {
+                let mut lemma = vec![prod_lit.negate(), lx.negate(), ly.negate()];
+                lemma.sort_by_key(|l| l.index());
+                lemma.dedup();
+                if lemma.len() >= 2 {
+                    return Some(lemma);
+                }
+            }
+        }
+        None
     }
 
     /// Attempt to certify that the currently-assigned polynomial atoms are
@@ -480,12 +828,8 @@ impl NlsatSolver {
         let mut sub_poly = factor.poly.clone();
         for v in factor.poly.vars() {
             if v != var {
-                if let Some(val) = self.assignment.arith_value(v) {
-                    sub_poly = sub_poly.substitute(v, &Polynomial::constant(val.clone()));
-                } else {
-                    // Another variable is unassigned: no constraint yet.
-                    return None;
-                }
+                let val = self.assignment.arith_value(v)?;
+                sub_poly = sub_poly.substitute(v, &Polynomial::constant(val.clone()));
             }
         }
 
