@@ -179,6 +179,11 @@ impl super::Solver {
             next_skolem_id: _, // INVARIANT: monotone — a popped scope's Skolem
                                // names must never be handed out again, so this counter deliberately
                                // survives `pop` (re-using an id would alias two distinct witnesses).
+            case_split_terms: _, // PER-SEARCH: cleared at `check_core` entry, so a
+            // value left by a popped scope's `check` is overwritten before the
+            // next search reads it (the case-split lemmas are SAT-scoped and
+            // retracted by `pop`; the dedup set must not outlive them).
+            case_split_rounds: _, // PER-SEARCH: same lifetime as `case_split_terms`
         } = self;
 
         debug_assert_eq!(self.trail.len(), state.trail_position);

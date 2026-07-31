@@ -14,6 +14,7 @@ pub(super) mod config;
 pub(super) mod dt_axioms;
 pub(super) mod encode;
 pub(super) mod encode_guards;
+pub(super) mod int_case_split;
 pub(super) mod model_builder;
 pub(super) mod model_eval;
 pub(super) mod pigeonhole;
@@ -254,6 +255,15 @@ pub struct Solver {
     /// configuration, the unsat-core and branching switches), and carried in the
     /// goal fingerprint so a cached verdict cannot survive one of them.
     pub(super) settings_epoch: u64,
+    /// Terms already given an explicit integer case-split lemma during the
+    /// current `check`, so we never re-split the same term.  Deduplication
+    /// makes the in-loop non-convex-LIA refinement terminate (see
+    /// [`Solver::refine_int_case_split`]).
+    pub(super) case_split_terms: FxHashSet<TermId>,
+    /// Number of reset-and-re-solve refinement rounds spent on integer
+    /// case-splitting within the current `check`.  Capped by
+    /// [`MAX_CASE_SPLIT_ROUNDS`] in `int_case_split`.
+    pub(super) case_split_rounds: u32,
 }
 
 /// Maximum term-nesting depth the recursive Tseitin encoder will descend
@@ -398,6 +408,8 @@ impl Solver {
             mbqi_round_clauses: Vec::new(),
             last_check: None,
             settings_epoch: 0,
+            case_split_terms: FxHashSet::default(),
+            case_split_rounds: 0,
         }
     }
 
@@ -670,6 +682,15 @@ impl Solver {
 
     /// Get a SAT variable for a term, then check satisfiability
     fn check_core(&mut self, manager: &mut TermManager) -> SolverResult {
+        // Per-search case-split bookkeeping: each CDCL search starts with a
+        // fresh dedup set and round counter.  The case-split lemmas are added
+        // at the current SAT assertion scope, so they are retracted by `pop`;
+        // resetting here (rather than only on full `reset`) keeps the dedup set
+        // consistent with the live clauses across a `push`/`check`/`pop` and a
+        // later `check`, so a term a popped scope already split is re-split if
+        // the live formula still needs it.  See [`int_case_split`].
+        self.case_split_terms.clear();
+        self.case_split_rounds = 0;
         // Check for trivial unsat (false assertion)
         if self.has_false_assertion {
             self.build_unsat_core_trivial_false();
@@ -929,6 +950,40 @@ impl Solver {
                             self.model = None;
                             self.unsat_core = None;
                             return SolverResult::Unknown;
+                        }
+                        // Non-convex LIA refinement: an integer UF argument
+                        // pinned to a small finite domain by arithmetic bounds is
+                        // invisible to Nelson–Oppen equality sharing (the
+                        // disjunction is never entailed case-by-case), so the
+                        // CDCL core has no atom to branch on its value and a
+                        // genuine `unsat` is wrongly reported `sat`.  Emit an
+                        // explicit `(or (= t lo) … (= t hi))` lemma for each
+                        // such term and re-solve.  See
+                        // [`Solver::refine_int_case_split`].
+                        if self.refine_int_case_split(manager) {
+                            self.sat.backtrack_to_root();
+                            self.euf.reset();
+                            self.arith.reset();
+                            self.bv.reset();
+                            theory_manager = TheoryManager::new(
+                                manager,
+                                &mut self.euf,
+                                &mut self.arith,
+                                &mut self.bv,
+                                &self.bv_terms,
+                                &self.var_to_constraint,
+                                &self.var_to_parsed_arith,
+                                &self.term_to_var,
+                                &self.var_to_term,
+                                &mut self.derived_reasons,
+                                self.config.theory_mode,
+                                &mut self.statistics,
+                                self.config.max_conflicts,
+                                self.config.max_decisions,
+                                self.has_bv_arith_ops,
+                                self.config.timeout_ms,
+                            );
+                            continue;
                         }
                         // Lazy array-axiom instantiation: the syntactic array
                         // pre-checks and EUF congruence do not implement a
@@ -1922,6 +1977,8 @@ impl Solver {
         // would license a finite-range expansion the new formula never asserts.
         self.entailed_int_consts.clear();
         self.entailed_int_consts_upto = 0;
+        self.case_split_terms.clear();
+        self.case_split_rounds = 0;
         self.debug_check_invariants("after reset");
     }
 
