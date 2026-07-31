@@ -14,38 +14,14 @@
 //!
 //! so nested tool-generated nests unit-propagate / collapse once indices pin.
 
-use std::sync::{Arc, Mutex};
-
 use num_traits::ToPrimitive;
 use oxiz_core::ast::{TermId, TermKind, TermManager, collect_subterms};
 use oxiz_core::sort::SortId;
-use oxiz_sat::{BranchingHeuristic, Lit, Var};
+use oxiz_sat::Lit;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::types::Constraint;
 use super::Solver;
-
-/// Prefer finite-domain table-index equalities over the rest of the search space.
-struct DomainFirstBranching {
-    /// var index → payload heuristic score (higher first)
-    domain_scores: FxHashMap<u32, i64>,
-}
-
-impl BranchingHeuristic for DomainFirstBranching {
-    fn select(&mut self, candidates: &[Var], _scores: &[f64]) -> Option<Var> {
-        let mut best: Option<Var> = None;
-        let mut best_sc = i64::MIN;
-        for &v in candidates {
-            if let Some(&sc) = self.domain_scores.get(&(v.index() as u32)) {
-                if sc > best_sc {
-                    best_sc = sc;
-                    best = Some(v);
-                }
-            }
-        }
-        best
-    }
-}
 
 const MIN_TABLE_CASES: usize = 4;
 const MAX_EAGER_TABLE_DOMAIN: i64 = 64;
@@ -161,11 +137,12 @@ impl Solver {
             if all_const {
                 const_vals.sort_unstable();
                 const_vals.dedup();
-                // Track 0/1 (and tiny) images for nest folding.
+                // Track 0/1 images for nest folding + result domain split.
                 if !const_vals.is_empty()
                     && const_vals.iter().all(|&v| v == 0 || v == 1)
                 {
                     self.zero_one_terms.insert(r);
+                    self.binary_table_results.insert(r);
                 }
             }
         }
@@ -390,7 +367,8 @@ impl Solver {
             by_rep.entry(rep).or_default().push(idx);
         }
 
-        let mut domain_branch_scores: FxHashMap<u32, i64> = FxHashMap::default();
+        // (rep_total_score, key_score, var) — sorted for domain_priority.
+        let mut domain_priority_scored: Vec<(i64, i64, oxiz_sat::Var)> = Vec::new();
 
         for (rep, idxs) in by_rep {
             if self.case_split_terms.contains(&rep) {
@@ -445,7 +423,7 @@ impl Solver {
                     }
                 }
                 (Some(lo), None) if !keys.is_empty() => {
-                    let kmax = *keys.iter().max().unwrap();
+                    let kmax = keys.iter().copied().max().unwrap_or(0);
                     if kmax >= lo && kmax - lo <= MAX_EAGER_TABLE_DOMAIN {
                         Some((lo..=kmax).collect())
                     } else {
@@ -474,8 +452,8 @@ impl Solver {
                     "[ite] SPLIT rep={} n_idx={} domain={}..{}",
                     rep.0,
                     idxs.len(),
-                    vals.first().unwrap(),
-                    vals.last().unwrap()
+                    vals.first().copied().unwrap_or(0),
+                    vals.last().copied().unwrap_or(0)
                 );
             }
 
@@ -499,14 +477,28 @@ impl Solver {
             // high-value keys (e.g. R9 scores) are tried first.
             let scores = self.table_index_key_score.get(&rep).cloned().unwrap_or_default();
             let max_score = scores.values().copied().max().unwrap_or(0).max(1);
-            for &(k, lit) in &pairs {
-                let sc = scores.get(&k).copied().unwrap_or(0);
-                // Base bump + up to 128 extra proportional to payload share.
+            let rep_total: i64 = scores.values().sum();
+            // Sort keys by payload for this index.
+            let mut keyed: Vec<(i64, Lit)> = pairs
+                .iter()
+                .map(|&(k, lit)| (scores.get(&k).copied().unwrap_or(0), lit))
+                .collect();
+            keyed.sort_by(|a, b| b.0.cmp(&a.0));
+            // Only force-priority the top keys of large domains (rest via VSIDS).
+            let top_n = if vals.len() <= 8 {
+                vals.len()
+            } else {
+                10.min(vals.len())
+            };
+            for (i, &(sc, lit)) in keyed.iter().enumerate() {
                 let base = if vals.len() <= 8 { 48 } else { 12 };
                 let extra = ((sc as u128 * 128) / max_score as u128) as u32;
                 self.sat.bump_var_activity(lit.var(), base + extra);
                 self.sat.set_preferred_phase(lit.var(), true);
-                domain_branch_scores.insert(lit.var().index() as u32, sc);
+                if i < top_n {
+                    // Group by rep importance, then key score.
+                    domain_priority_scored.push((rep_total, sc, lit.var()));
+                }
             }
             self.table_index_domain_eqs.insert(rep, pairs.clone());
             self.case_split_terms.insert(rep);
@@ -518,12 +510,42 @@ impl Solver {
             }
         }
 
-        if !domain_branch_scores.is_empty() {
-            let h = DomainFirstBranching {
-                domain_scores: domain_branch_scores,
-            };
-            self.sat
-                .set_external_branching(Arc::new(Mutex::new(h)));
+        if !domain_priority_scored.is_empty() {
+            // High-importance indices first, then high payload keys within.
+            domain_priority_scored.sort_by(|a, b| {
+                b.0.cmp(&a.0)
+                    .then_with(|| b.1.cmp(&a.1))
+                    .then_with(|| a.2.index().cmp(&b.2.index()))
+            });
+            let vars: Vec<_> = domain_priority_scored.into_iter().map(|(_, _, v)| v).collect();
+            self.sat.set_domain_priority(vars);
+        }
+    }
+
+    /// Case-split 0/1 table results so `(> r 0)` links to `(= r 1)`.
+    pub(super) fn eager_binary_result_case_split(&mut self, manager: &mut TermManager) {
+        if self.binary_table_results.is_empty() {
+            return;
+        }
+        let results: Vec<TermId> = self.binary_table_results.iter().copied().collect();
+        let zero = manager.mk_int(0);
+        let one = manager.mk_int(1);
+        for r in results {
+            if self.case_split_terms.contains(&r) {
+                continue;
+            }
+            let eq0 = manager.mk_eq(r, zero);
+            let eq1 = manager.mk_eq(r, one);
+            let lit0 = self.encode_depth(eq0, manager, 0);
+            let lit1 = self.encode_depth(eq1, manager, 0);
+            // Exactly one of r=0, r=1.
+            self.sat.add_clause([lit0, lit1]);
+            self.sat.add_clause([lit0.negate(), lit1.negate()]);
+            self.table_index_domain_eqs
+                .insert(r, vec![(0, lit0), (1, lit1)]);
+            self.case_split_terms.insert(r);
+            // Don't put these on domain_priority — index vars first; result
+            // eqs should unit-prop from table implications once index is set.
         }
     }
 
@@ -551,7 +573,7 @@ impl Solver {
         self.case_split_terms.insert(idx);
     }
 
-    /// Boolean-link comparison atoms on table indices to domain eqs.
+    /// Boolean-link comparison atoms on table indices/results to domain eqs.
     pub(super) fn link_table_index_comparisons(&mut self, manager: &mut TermManager) {
         if self.table_index_domain_eqs.is_empty() {
             return;

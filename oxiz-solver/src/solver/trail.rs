@@ -185,6 +185,10 @@ impl super::Solver {
             // to order VSIDS bumps; a stale entry only re-orders a *valid*
             // branching hint, so it is sound to leave it (cleared only by
             // `reset`).
+            binary_table_results: _, // accumulates flattened 0/1-valued table results
+            // across `assert`s; a stale entry only re-emits *valid* (redundant)
+            // result splits / comparison links, so it is sound to leave it
+            // (cleared only by `reset`).
             dt_var_constructors: _,      // TRAIL: DtVarConstructorAdded
             arith_parse_cache: _,        // INVARIANT: keyed by term structure
             tracked_compound_terms: _,   // TRAIL: TrackedCompoundAdded

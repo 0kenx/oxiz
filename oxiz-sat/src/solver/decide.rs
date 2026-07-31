@@ -5,6 +5,15 @@ use super::*;
 impl Solver {
     /// Pick next variable to branch on
     pub(super) fn pick_branch_var(&mut self) -> Option<Var> {
+        // Finite-domain equalities first (O(|priority|), not O(num_vars)).
+        if !self.domain_priority.is_empty() {
+            for &v in &self.domain_priority {
+                if !self.trail.is_assigned(v) && !self.var_eliminated(v) {
+                    return Some(v);
+                }
+            }
+        }
+
         // Try external branching heuristic first.
         if let Some(ref ext) = self.config.external_branching {
             let candidates: Vec<Var> = (0..self.num_vars)

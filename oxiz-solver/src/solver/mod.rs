@@ -177,6 +177,9 @@ pub struct Solver {
     /// absolute constant payloads at that key across flattened tables.  Used to
     /// VSIDS-bump high-value domain equalities first (e.g. R9-heavy indices).
     pub(super) table_index_key_score: FxHashMap<TermId, FxHashMap<i64, i64>>,
+    /// Flattened table results known to be 0/1-valued (for cheap result domain
+    /// split + comparison linking so `(> r 0)` unit-props when `r` is fixed).
+    pub(super) binary_table_results: FxHashSet<TermId>,
     /// Datatype constructor constraints: variable -> constructor name
     /// Used to detect mutual exclusivity conflicts (var = C1 AND var = C2 where C1 != C2)
     pub(super) dt_var_constructors: FxHashMap<TermId, oxiz_core::interner::Spur>,
@@ -437,6 +440,7 @@ impl Solver {
             table_index_keys: FxHashMap::default(),
             unit_eq_rep: FxHashMap::default(),
             table_index_key_score: FxHashMap::default(),
+            binary_table_results: FxHashSet::default(),
             dt_var_constructors: FxHashMap::default(),
             arith_parse_cache: FxHashMap::default(),
             tracked_compound_terms: FxHashSet::default(),
@@ -948,8 +952,9 @@ impl Solver {
         // lookup problems where the first SAT model otherwise disagrees with
         // arithmetic and trips the model-refutation honesty gate.
         self.eager_table_index_case_split(manager);
-        // Connect `(> idx c)` / … atoms to domain equalities so nested ite
-        // guards on indices fire by unit propagation once CDCL picks `idx`.
+        self.eager_binary_result_case_split(manager);
+        // Connect `(> idx c)` / `(> r 0)` atoms to domain equalities so nested
+        // ite guards fire by unit propagation once CDCL picks a value.
         self.link_table_index_comparisons(manager);
 
         // Theory-aware decision hint: prioritize finite-domain value atoms.
@@ -2162,6 +2167,7 @@ impl Solver {
         self.table_index_keys.clear();
         self.unit_eq_rep.clear();
         self.table_index_key_score.clear();
+        self.binary_table_results.clear();
         self.dt_var_constructors.clear();
         self.arith_parse_cache.clear();
         self.tracked_compound_terms.clear();

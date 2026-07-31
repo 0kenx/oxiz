@@ -494,6 +494,9 @@ pub struct Solver {
     pub(super) watches: WatchLists,
     /// VSIDS branching heuristic
     pub(super) vsids: VSIDS,
+    /// Prefer these variables before VSIDS (highest priority first). Cleared
+    /// when empty; used for finite-domain table-index equalities.
+    pub(super) domain_priority: Vec<Var>,
     /// VMTF move-to-front decision queue (cadical focused-mode branching).
     pub(super) vmtf: VMTF,
     /// CHB branching heuristic
@@ -731,6 +734,7 @@ impl Solver {
             trail: Trail::new(0),
             watches: WatchLists::new(0),
             vsids: VSIDS::new(0),
+            domain_priority: Vec::new(),
             vmtf: VMTF::new(0),
             chb: CHB::new(0),
             lrb: LRB::new(0),
@@ -1276,6 +1280,14 @@ impl Solver {
     /// Install (or replace) an external branching heuristic.
     pub fn set_external_branching(&mut self, h: crate::solver::BoxedBranchingHeuristic) {
         self.config.external_branching = Some(h);
+    }
+
+    /// Variables to decide before VSIDS (highest priority first).
+    ///
+    /// Finite-domain table-index equalities: O(|priority|) per decision instead
+    /// of scanning all unassigned vars via external branching.
+    pub fn set_domain_priority(&mut self, vars: Vec<Var>) {
+        self.domain_priority = vars;
     }
 
     /// Returns `true` when the search must stop early: the conflict budget has
@@ -2436,6 +2448,7 @@ impl Solver {
         self.trail.clear();
         self.watches.clear();
         self.vsids.clear();
+        self.domain_priority.clear();
         self.chb.clear();
         self.stats = SolverStats::default();
         self.learnt.clear();
