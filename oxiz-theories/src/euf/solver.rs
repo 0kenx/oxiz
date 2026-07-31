@@ -251,6 +251,25 @@ pub struct EufSolver {
     /// root cause of missed congruences / spurious sat). Parallel to `nodes`;
     /// truncated in lockstep on `pop`.
     node_sig_key: Vec<Option<(u32, SmallVec<[u32; 4]>)>>,
+    /// Per-representative watch list of disequality indices: `diseq_watch[rep]`
+    /// holds every asserted disequality with an endpoint currently in `rep`'s
+    /// class. On a merge the loser class's watched disequalities are tested
+    /// (both endpoints now equal -> conflict) and copied to the winner, so a
+    /// violation is caught at the merge that causes it and `check_conflicts`
+    /// never scans all disequalities. Mirrors the `use_list` migration + trailing.
+    diseq_watch: Vec<Vec<u32>>,
+    /// Undo trail for `diseq_watch` appends: the rep whose list was extended.
+    diseq_watch_trail: Vec<u32>,
+    /// Scope checkpoints into `diseq_watch_trail`, parallel to `sig_trail_limits`.
+    diseq_watch_trail_limits: Vec<usize>,
+    /// Index (into `diseqs`) of a disequality detected violated during a merge or
+    /// at `assert_diseq`, awaiting `check_conflicts` to surface it. None = none.
+    pending_diseq_conflict: Option<u32>,
+    /// Saved `pending_diseq_conflict` per scope so `pop()` restores it: a
+    /// violation found inside a popped scope retracts with the merge that caused it.
+    pending_trail: Vec<Option<u32>>,
+    /// Scope checkpoints into `pending_trail`.
+    pending_trail_limits: Vec<usize>,
     /// Fingerprint table: maps fingerprint -> list of node indices with that fingerprint.
     /// Used as a fast pre-filter before full signature comparison in congruence checks.
     ///
@@ -348,6 +367,12 @@ impl EufSolver {
             use_list: Vec::new(),
             sig_table: FxHashMap::default(),
             node_sig_key: Vec::new(),
+            diseq_watch: Vec::new(),
+            diseq_watch_trail: Vec::new(),
+            diseq_watch_trail_limits: Vec::new(),
+            pending_diseq_conflict: None,
+            pending_trail: Vec::new(),
+            pending_trail_limits: Vec::new(),
             fingerprint_table: FxHashMap::default(),
             context_stack: Vec::new(),
             proof_forest: Vec::new(),
@@ -482,11 +507,25 @@ impl EufSolver {
 
     /// Assert a disequality
     pub fn assert_diseq(&mut self, a: u32, b: u32, reason: TermId) {
+        let idx = self.diseqs.len() as u32;
         self.diseqs.push(Diseq {
             lhs: a,
             rhs: b,
             reason,
         });
+        // Watch the disequality on each endpoint's current representative.
+        // When either class later merges, `propagate` tests it for violation.
+        // find_no_compress (read-only): the watch key is the current rep, and
+        // migration on merge keeps it current, so we never need to mutate here.
+        let ra = self.uf.find_no_compress(a);
+        let rb = self.uf.find_no_compress(b);
+        self.diseq_watch_push(ra, idx);
+        if ra != rb {
+            self.diseq_watch_push(rb, idx);
+        } else if self.pending_diseq_conflict.is_none() {
+            // Already equal: the new disequality is violated right now.
+            self.pending_diseq_conflict = Some(idx);
+        }
     }
 
     /// Check if two terms are equivalent
@@ -743,6 +782,11 @@ impl Theory for EufSolver {
         // Record use_list_trail checkpoint so pop() can rewind use-list appends
         // to pre-existing nodes made during this scope.
         self.use_list_trail_limits.push(self.use_list_trail.len());
+        // Disequality watch-list + pending-conflict checkpoints for pop().
+        self.diseq_watch_trail_limits
+            .push(self.diseq_watch_trail.len());
+        self.pending_trail_limits.push(self.pending_trail.len());
+        self.pending_trail.push(self.pending_diseq_conflict);
     }
 
     fn pop(&mut self) {
@@ -765,6 +809,7 @@ impl Theory for EufSolver {
             self.use_list.truncate(num_nodes);
             self.proof_forest.truncate(num_nodes);
             self.node_sig_key.truncate(num_nodes);
+            self.diseq_watch.truncate(num_nodes);
 
             // Rewind use_list_trail: for each append recorded during the popped
             // scope, pop exactly one entry off the recorded node's use-list.
@@ -798,6 +843,31 @@ impl Theory for EufSolver {
 
             // Any cached explanation may reference edges just removed; drop them.
             self.expl_cache.clear();
+
+            // Rewind diseq_watch_trail: for each watch-list append recorded
+            // during the popped scope, pop one entry off the recorded rep's list
+            // (mirror of use_list_trail above).
+            if let Some(dw_limit) = self.diseq_watch_trail_limits.pop() {
+                while self.diseq_watch_trail.len() > dw_limit {
+                    let Some(rep) = self.diseq_watch_trail.pop() else {
+                        break;
+                    };
+                    if (rep as usize) < self.diseq_watch.len() {
+                        self.diseq_watch[rep as usize].pop();
+                    }
+                }
+            }
+            // Restore pending_diseq_conflict to its scope-entry value: the saved
+            // value lives at index `pending_limit` (pushed at scope entry), then
+            // the trail is rewound to that checkpoint.
+            if let Some(pending_limit) = self.pending_trail_limits.pop() {
+                self.pending_diseq_conflict = self
+                    .pending_trail
+                    .get(pending_limit)
+                    .copied()
+                    .unwrap_or(None);
+                self.pending_trail.truncate(pending_limit);
+            }
 
             // Remove term_to_node mappings that point to removed nodes.  Every
             // term maps to the node created for it (never to a borrowed congruent
@@ -851,6 +921,12 @@ impl Theory for EufSolver {
         self.use_list.clear();
         self.sig_table.clear();
         self.node_sig_key.clear();
+        self.diseq_watch.clear();
+        self.diseq_watch_trail.clear();
+        self.diseq_watch_trail_limits.clear();
+        self.pending_diseq_conflict = None;
+        self.pending_trail.clear();
+        self.pending_trail_limits.clear();
         self.fingerprint_table.clear();
         self.context_stack.clear();
         self.proof_forest.clear();

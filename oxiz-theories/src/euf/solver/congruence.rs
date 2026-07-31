@@ -118,6 +118,22 @@ impl EufSolver {
         }
     }
 
+    /// Append `diseq_idx` to `rep`'s disequality watch list, recording the append
+    /// on `diseq_watch_trail` when a scope is active so `pop()` removes it.
+    /// Auto-sizes `diseq_watch` to cover `rep` (reps are node ids, so the vector
+    /// parallels `use_list`/`nodes`).
+    #[inline]
+    pub(super) fn diseq_watch_push(&mut self, rep: u32, diseq_idx: u32) {
+        let r = rep as usize;
+        if r >= self.diseq_watch.len() {
+            self.diseq_watch.resize_with(r + 1, Vec::new);
+        }
+        self.diseq_watch[r].push(diseq_idx);
+        if !self.diseq_watch_trail_limits.is_empty() {
+            self.diseq_watch_trail.push(rep);
+        }
+    }
+
     /// Publish `node` under the signature `(func, args)` with fingerprint `fp`.
     ///
     /// The caller must have established that the key is **absent** — the undo
@@ -283,6 +299,27 @@ impl EufSolver {
 
             // Congruence closure: check for new merges
             let other_root = if new_root == root_a { root_b } else { root_a };
+
+            // Eager disequality check: every disequality watched on the loser
+            // class (`other_root`) has an endpoint whose class just merged into
+            // `new_root`. Test each for violation (both endpoints now equal),
+            // then copy it onto `new_root`'s watch list so future merges keep
+            // testing it. This replaces check_conflicts' O(diseqs) full scan —
+            // the dominant EUF cost — with O(watched-by-this-class) per merge.
+            let dw_len = self
+                .diseq_watch
+                .get(other_root as usize)
+                .map_or(0, Vec::len);
+            for i in 0..dw_len {
+                let didx = self.diseq_watch[other_root as usize][i];
+                let d = &self.diseqs[didx as usize];
+                if self.pending_diseq_conflict.is_none()
+                    && self.uf.find_no_compress(d.lhs) == self.uf.find_no_compress(d.rhs)
+                {
+                    self.pending_diseq_conflict = Some(didx);
+                }
+                self.diseq_watch_push(new_root, didx);
+            }
 
             // --- Optimization 1: Index-based use-list iteration ---
             // Instead of cloning the entire use-list, iterate by index.

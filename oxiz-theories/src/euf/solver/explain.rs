@@ -36,16 +36,14 @@ impl EufSolver {
     /// admissible substitute: any *smaller* set would claim a refutation that its
     /// members do not support.
     pub fn check_conflicts(&mut self) -> Option<Vec<TermId>> {
-        // First find the conflicting disequality by index so that we can drop
-        // the shared borrow on `self.diseqs` before calling `explain_equality`
-        // (which needs `&mut self`).
-        let conflict_idx = self
-            .diseqs
-            .iter()
-            .position(|d| self.uf.same(d.lhs, d.rhs))?;
+        // Disequality violations are detected eagerly — at the merge (or the
+        // assert_diseq) that causes them, recorded in `pending_diseq_conflict`.
+        // So this is O(1): surface the pending violation, or report none. The
+        // old O(diseqs) full scan on every theory check was the dominant EUF cost.
+        let conflict_idx = self.pending_diseq_conflict?;
 
         let (lhs, rhs, reason) = {
-            let d = &self.diseqs[conflict_idx];
+            let d = &self.diseqs[conflict_idx as usize];
             (d.lhs, d.rhs, d.reason)
         };
 
