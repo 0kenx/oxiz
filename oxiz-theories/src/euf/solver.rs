@@ -35,8 +35,19 @@ const EUF_EXPL_CACHE_CAPACITY: usize = 1024;
 /// Records an insertion into sig_table or fingerprint_table for undo on pop().
 #[derive(Debug, Clone)]
 enum SigTrailEntry {
-    /// Inserted key into sig_table; undo removes this key.
-    InsertedSig { key: (u32, SmallVec<[u32; 4]>) },
+    /// Inserted `key -> node` into sig_table; undo removes `key` and restores
+    /// `node_sig_key[node]` to `None` (the state before this registration).
+    InsertedSig {
+        key: (u32, SmallVec<[u32; 4]>),
+        node: u32,
+    },
+    /// Removed `key -> node` from sig_table because the node's signature changed
+    /// in `propagate`; undo re-inserts `key -> node` and restores
+    /// `node_sig_key[node] = Some(key)`.
+    RemovedSig {
+        key: (u32, SmallVec<[u32; 4]>),
+        node: u32,
+    },
     /// Pushed node_idx into fingerprint_table[fp]; undo removes it from the bucket.
     InsertedFingerprint { fp: ENodeFingerprint, node_idx: u32 },
 }
@@ -232,6 +243,14 @@ pub struct EufSolver {
     use_list: Vec<SmallVec<[u32; 8]>>,
     /// Signature table for congruence closure
     sig_table: FxHashMap<(u32, SmallVec<[u32; 4]>), u32>,
+    /// For each node, the key under which it is currently registered in
+    /// `sig_table` (`None` for leaf nodes and for app nodes merged into a
+    /// congruent existing node on intern). `propagate` consults this to remove a
+    /// node's *old* signature entry when its canonical arguments change, so that
+    /// stale entries keyed by obsolete representatives never accumulate (the
+    /// root cause of missed congruences / spurious sat). Parallel to `nodes`;
+    /// truncated in lockstep on `pop`.
+    node_sig_key: Vec<Option<(u32, SmallVec<[u32; 4]>)>>,
     /// Fingerprint table: maps fingerprint -> list of node indices with that fingerprint.
     /// Used as a fast pre-filter before full signature comparison in congruence checks.
     ///
@@ -328,6 +347,7 @@ impl EufSolver {
             pending: Vec::new(),
             use_list: Vec::new(),
             sig_table: FxHashMap::default(),
+            node_sig_key: Vec::new(),
             fingerprint_table: FxHashMap::default(),
             context_stack: Vec::new(),
             proof_forest: Vec::new(),
@@ -360,6 +380,7 @@ impl EufSolver {
         self.uf.add();
         self.use_list.push(SmallVec::new());
         self.proof_forest.push(SmallVec::new());
+        self.node_sig_key.push(None);
         self.term_to_node.insert(term, idx);
         idx
     }
@@ -404,7 +425,7 @@ impl EufSolver {
         let fp = ENodeFingerprint::compute(func, &canonical_args);
 
         let sig = (func, canonical_args);
-        let congruent = self.sig_table.get(&sig).copied();
+        let congruent = self.lookup_valid_sig(&sig);
 
         let idx = self.nodes.len() as u32;
         self.nodes
@@ -412,6 +433,15 @@ impl EufSolver {
         self.uf.add();
         self.use_list.push(SmallVec::new());
         self.proof_forest.push(SmallVec::new());
+        // Record the key under which this node is registered in sig_table (None
+        // when it will merge into a congruent existing node and so never publish
+        // its own signature), so a later signature change in `propagate` can
+        // remove exactly this entry.
+        self.node_sig_key.push(if congruent.is_some() {
+            None
+        } else {
+            Some(sig.clone())
+        });
         self.term_to_node.insert(term, idx);
 
         // Register the application on the *representative* of each argument, so a
@@ -724,6 +754,7 @@ impl Theory for EufSolver {
             // pre-existing nodes' lists — those are undone via proof_trail below.
             self.use_list.truncate(num_nodes);
             self.proof_forest.truncate(num_nodes);
+            self.node_sig_key.truncate(num_nodes);
 
             // Rewind use_list_trail: for each append recorded during the popped
             // scope, pop exactly one entry off the recorded node's use-list.
@@ -771,8 +802,17 @@ impl Theory for EufSolver {
                 while self.sig_trail.len() > sig_limit {
                     if let Some(entry) = self.sig_trail.pop() {
                         match entry {
-                            SigTrailEntry::InsertedSig { key } => {
+                            SigTrailEntry::InsertedSig { key, node } => {
                                 self.sig_table.remove(&key);
+                                if let Some(slot) = self.node_sig_key.get_mut(node as usize) {
+                                    *slot = None;
+                                }
+                            }
+                            SigTrailEntry::RemovedSig { key, node } => {
+                                self.sig_table.insert(key.clone(), node);
+                                if let Some(slot) = self.node_sig_key.get_mut(node as usize) {
+                                    *slot = Some(key);
+                                }
                             }
                             SigTrailEntry::InsertedFingerprint { fp, node_idx } => {
                                 if let Some(bucket) = self.fingerprint_table.get_mut(&fp) {
@@ -800,6 +840,7 @@ impl Theory for EufSolver {
         self.pending.clear();
         self.use_list.clear();
         self.sig_table.clear();
+        self.node_sig_key.clear();
         self.fingerprint_table.clear();
         self.context_stack.clear();
         self.proof_forest.clear();

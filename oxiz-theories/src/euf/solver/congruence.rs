@@ -144,6 +144,7 @@ impl EufSolver {
             // Clone before the key is moved into the insert below.
             self.sig_trail.push(SigTrailEntry::InsertedSig {
                 key: (func, args.clone()),
+                node,
             });
         }
         self.sig_table.insert((func, args), node);
@@ -151,6 +152,63 @@ impl EufSolver {
         if in_scope {
             self.sig_trail
                 .push(SigTrailEntry::InsertedFingerprint { fp, node_idx: node });
+        }
+    }
+
+    /// Replace `user`'s entry in `sig_table` with `new_key`: remove its
+    /// previously-recorded key (from `intern_app` or a prior signature change),
+    /// insert `new_key -> user`, record both operations on `sig_trail` (when in
+    /// scope) so `pop()` restores the prior state exactly, and update
+    /// `node_sig_key[user]`.
+    ///
+    /// Root-cause fix for the stale sig-table-entry bug: without the removal,
+    /// every signature change in `propagate` left a dead entry keyed by obsolete
+    /// representatives, and under specific push/pop orderings those dead entries
+    /// resurrect into a spurious (or missed) congruence that `pop` partially
+    /// undoes — leaving the incremental closure in a state a from-scratch
+    /// rebuild never reaches (missed congruence / spurious sat).
+    ///
+    /// Callers only invoke this when `new_key` is known absent (fingerprint /
+    /// sig pre-checks), so the insert never overwrites a different live entry.
+    #[inline]
+    fn update_sig_entry(&mut self, user: u32, new_key: (u32, SmallVec<[u32; 4]>), in_scope: bool) {
+        // Remove the node's prior key, if any (leaf/congruent-merged -> None).
+        if let Some(Some(old_key)) = self.node_sig_key.get(user as usize) {
+            self.sig_table.remove(old_key);
+            if in_scope {
+                self.sig_trail.push(SigTrailEntry::RemovedSig {
+                    key: old_key.clone(),
+                    node: user,
+                });
+            }
+        }
+        self.sig_table.insert(new_key.clone(), user);
+        if in_scope {
+            self.sig_trail.push(SigTrailEntry::InsertedSig {
+                key: new_key.clone(),
+                node: user,
+            });
+        }
+        self.node_sig_key[user as usize] = Some(new_key);
+    }
+
+    /// Look up `sig` in `sig_table`, returning the registered node only if its
+    /// *current* canonical signature still equals `sig` (per `node_sig_key`).
+    /// A stale entry — left behind before `update_sig_entry` existed — is
+    /// evicted so it can never dedup a freshly-interned term to a node it isn't
+    /// actually congruent to.
+    pub(super) fn lookup_valid_sig(&mut self, sig: &(u32, SmallVec<[u32; 4]>)) -> Option<u32> {
+        let node = self.sig_table.get(sig).copied()?;
+        let valid = self
+            .node_sig_key
+            .get(node as usize)
+            .map(|k| k.as_ref() == Some(sig))
+            .unwrap_or(false);
+        if valid {
+            Some(node)
+        } else {
+            self.sig_table.remove(sig);
+            None
         }
     }
 
@@ -299,10 +357,21 @@ impl EufSolver {
                     }
                 }
 
-                // No congruence match; publish this node under its new signature so
-                // the *next* use-list entry in this very scan can congruence-match
-                // against it.
-                self.insert_signature(func, canon_buf.clone(), user, new_fp);
+                // No congruence match; publish this node under its *new* signature,
+                // first removing its now-stale old entry (keyed by the previous
+                // argument representatives) so obsolete keys never accumulate and
+                // resurrect into a spurious/missed congruence. The fingerprint
+                // table is a prefilter only (sig_table is authoritative), so its
+                // stale old bucket is left for the next scan to ignore.
+                let in_scope = !self.sig_trail_limits.is_empty();
+                self.update_sig_entry(user, (func, canon_buf.clone()), in_scope);
+                self.fingerprint_table.entry(new_fp).or_default().push(user);
+                if in_scope {
+                    self.sig_trail.push(SigTrailEntry::InsertedFingerprint {
+                        fp: new_fp,
+                        node_idx: user,
+                    });
+                }
             }
 
             // Enqueue congruence merges
