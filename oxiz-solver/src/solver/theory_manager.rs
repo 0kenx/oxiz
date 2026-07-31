@@ -515,7 +515,10 @@ impl<'a> TheoryManager<'a> {
     /// it back into literals.  An equality congruence closure cannot explain is
     /// not propagated at all: losing a propagation costs completeness, asserting
     /// an unexplainable fact costs soundness.
-    fn propagate_euf_equalities_to_arith(&mut self) -> TheoryCheckResult {
+    fn propagate_euf_equalities_to_arith(
+        &mut self,
+        dedup: &mut FxHashSet<(TermId, TermId)>,
+    ) -> TheoryCheckResult {
         // Collect every unique term ID that appears in any parsed arithmetic
         // constraint.  These are the terms the arithmetic solver knows about.
         let mut arith_terms: Vec<TermId> = Vec::new();
@@ -527,28 +530,39 @@ impl<'a> TheoryManager<'a> {
             }
         }
 
-        // For each pair of arith terms, check if they are EUF-equal.
-        // `euf.intern(t)` looks up `term_to_node` first, so two terms that
-        // share the same EUF node (via congruence at intern-time) correctly
-        // return the same node index.
-        for i in 0..arith_terms.len() {
-            for j in (i + 1)..arith_terms.len() {
-                let t1 = arith_terms[i];
-                let t2 = arith_terms[j];
-                if t1 == t2 {
-                    continue;
-                }
-                // Only consider terms that have been registered in EUF.
-                let Some(n1) = self.euf.term_to_node(t1) else {
-                    continue;
-                };
-                let Some(n2) = self.euf.term_to_node(t2) else {
-                    continue;
-                };
-                if self.euf.are_equal(n1, n2)
-                    && let Some(conflict) = self.assert_explained_equality(t1, t2)
-                {
-                    return conflict;
+        // Incremental: group arith terms by EUF equivalence-class root and only
+        // consider pairs *within* a class.  The old O(n^2) all-pairs scan (most
+        // pairs are in different EUF classes and can never be equal) dominated
+        // runtime on QF_UFLIA, where this runs once per full SAT assignment.
+        // The class index skips the cross-class pairs for free; `dedup` avoids
+        // re-asserting a pair already sent to Arith this call.
+        let mut classes: FxHashMap<u32, Vec<TermId>> = FxHashMap::default();
+        for term in &arith_terms {
+            let Some(node) = self.euf.term_to_node(*term) else {
+                continue;
+            };
+            let root = self.euf.find(node);
+            classes.entry(root).or_default().push(*term);
+        }
+
+        for members in classes.values() {
+            if members.len() < 2 {
+                continue;
+            }
+            for i in 0..members.len() {
+                for j in (i + 1)..members.len() {
+                    let (mut t1, mut t2) = (members[i], members[j]);
+                    if t1 > t2 {
+                        std::mem::swap(&mut t1, &mut t2);
+                    }
+                    if !dedup.insert((t1, t2)) {
+                        continue;
+                    }
+                    // EUF has derived t1 = t2 (same class). Assert the equality
+                    // into the arithmetic solver.
+                    if let Some(conflict) = self.assert_explained_equality(t1, t2) {
+                        return conflict;
+                    }
                 }
             }
         }
@@ -1750,7 +1764,8 @@ impl TheoryCallback for TheoryManager<'_> {
         // When EUF fires congruence closure and derives f(x) = f(y) because
         // x = y was asserted, the arithmetic solver is unaware of this equality.
         // We must propagate it so the arithmetic solver can detect contradictions.
-        let eq_result = self.propagate_euf_equalities_to_arith();
+        let mut propagate_dedup: FxHashSet<(TermId, TermId)> = FxHashSet::default();
+        let eq_result = self.propagate_euf_equalities_to_arith(&mut propagate_dedup);
         if let TheoryCheckResult::Conflict(_) = eq_result {
             self.statistics.theory_conflicts += 1;
             self.statistics.conflicts += 1;
