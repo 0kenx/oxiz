@@ -952,6 +952,51 @@ impl Solver {
     ///
     /// When the structural recursion exceeds [`ENCODE_DEPTH_LIMIT`](super::ENCODE_DEPTH_LIMIT) we stop
     /// descending, set [`Solver::encode_depth_exceeded`], and return a fresh
+    /// Encode the conditional-equality semantics of a non-Bool `ite` that appears
+    /// as an operand of a theory equality `(= a b)`.
+    ///
+    /// `(= a (ite c t e))` (non-Bool sort) holds iff `(c -> a=t) & (~c -> a=e)`.
+    /// EUF has no built-in `ite`, so without these clauses the `ite` is interned
+    /// as an opaque leaf and the conditional equality never reaches congruence
+    /// closure — a false-SAT on mux-heavy QF_UF (e.g. firewire). Only the forward
+    /// direction is added (soundness needs the theory to detect every conflict);
+    /// each generated `(= a t)` / `(= a e)` atom recurses through `encode_depth`,
+    /// so nested `ite`s are handled. Bool-sorted `ite`s are left to the gate
+    /// encoder.
+    fn encode_nonbool_ite_equality(
+        &mut self,
+        eq_var: Var,
+        lhs: TermId,
+        rhs: TermId,
+        manager: &mut TermManager,
+        depth: u32,
+    ) {
+        let eq_neg = Lit::neg(eq_var);
+        for (a, b) in [(lhs, rhs), (rhs, lhs)] {
+            let Some(bt) = manager.get(b) else {
+                continue;
+            };
+            let TermKind::Ite(cond, then_br, else_br) = &bt.kind else {
+                continue;
+            };
+            if bt.sort == manager.sorts.bool_sort {
+                continue;
+            }
+            // Clone out of the immutable borrow before mutating `manager`.
+            let (cond, then_br, else_br) = (*cond, *then_br, *else_br);
+            let cond_lit = self.encode_depth(cond, manager, depth + 1);
+            let lt = manager.mk_eq(a, then_br);
+            let le = manager.mk_eq(a, else_br);
+            let lt_lit = self.encode_depth(lt, manager, depth + 1);
+            let le_lit = self.encode_depth(le, manager, depth + 1);
+            // eq &  c -> a=t
+            self.sat.add_clause([eq_neg, cond_lit.negate(), lt_lit]);
+            // eq & ~c -> a=e
+            self.sat.add_clause([eq_neg, cond_lit, le_lit]);
+            break; // handled the (a,b) direction; no need to also do (b,a)
+        }
+    }
+
     /// literal for the sub-term.  The truncated encoding is deliberately
     /// incomplete: `check` observes the flag and answers `Unknown` rather than
     /// crashing the process with a stack overflow or trusting a partial model.
@@ -1269,6 +1314,17 @@ impl Solver {
                             self.var_to_parsed_arith.insert(var, parsed);
                         }
                     }
+
+                    // Non-Bool `ite` in either operand: `(= a (ite c t e))` is
+                    // equivalent to `(c -> a=t) & (~c -> a=e)`. EUF otherwise
+                    // treats the `ite` as an opaque leaf and misses the
+                    // conditional equality, yielding false-SAT on mux-heavy
+                    // benchmarks (e.g. firewire). Add the forward implication
+                    // clauses so that, once the SAT core pins `c`, the
+                    // corresponding `(= a t)` / `(= a e)` atom is forced and EUF
+                    // merges them. Nested `ite`s are handled by recursing through
+                    // `encode_depth` on those atoms.
+                    self.encode_nonbool_ite_equality(var, *lhs, *rhs, manager, depth);
 
                     Lit::pos(var)
                 }
