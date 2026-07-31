@@ -518,6 +518,16 @@ impl EufSolver {
         self.nodes.len()
     }
 
+    /// Whether the e-graph contains any function-application nodes (as opposed
+    /// to only leaf constants). Used to gate the from-scratch rebuild backstop
+    /// in the CDCL(T) final check: the incremental-state false-sat bug
+    /// (live e-graph diverging from a fresh replay of the same equalities)
+    /// manifests on function-bearing EUF, not on pure-equality (constants-only)
+    /// problems.
+    pub fn has_app_nodes(&self) -> bool {
+        self.nodes.iter().any(|n| n.is_app())
+    }
+
     /// Get the term associated with a node index
     pub fn node_term(&self, idx: u32) -> Option<TermId> {
         self.nodes.get(idx as usize).map(|n| n.term)

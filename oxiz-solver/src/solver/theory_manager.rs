@@ -1723,6 +1723,29 @@ impl TheoryCallback for TheoryManager<'_> {
             return conflict;
         }
 
+        // Soundness backstop: the incremental EUF state, built up across CDCL
+        // push/pop, can lose a congruence or disequality, so the live
+        // `check_conflicts` above can report a spurious "consistent" on a
+        // genuinely-unsatisfiable, *function-bearing* assignment (the live
+        // e-graph diverges from a fresh replay of the same asserted equalities).
+        // Rebuild the theory state from the deduplicated shadow trail and
+        // re-check; honor any conflict the rebuild finds that the incremental
+        // state missed. Gated on `has_app_nodes` because the divergence is
+        // specific to function-bearing EUF, and pure-equality problems would be
+        // unfairly penalized by the per-final_check rebuild cost.
+        if self.euf.has_app_nodes() {
+            let replay = self.resync_theory_state();
+            if let TheoryCheckResult::Conflict(conflict_lits) = replay {
+                self.statistics.theory_conflicts += 1;
+                self.statistics.conflicts += 1;
+                if self.max_conflicts > 0 && self.statistics.conflicts >= self.max_conflicts {
+                    self.resource_exhausted = true;
+                    return TheoryCheckResult::Sat;
+                }
+                return TheoryCheckResult::Conflict(conflict_lits);
+            }
+        }
+
         // Propagate EUF-derived equalities into the arithmetic solver.
         // When EUF fires congruence closure and derives f(x) = f(y) because
         // x = y was asserted, the arithmetic solver is unaware of this equality.
