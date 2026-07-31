@@ -500,6 +500,11 @@ impl Solver {
         // conditional side-conditions, so EUF sees the selected-branch equality
         // in every position (direct equality operand, nested in an app arg, …).
         let term = self.eliminate_nonbool_ite(term, manager);
+        // Abstract compound Bool subterms used as UF arguments into fresh Bool
+        // vars + defining equalities, so Bool completion can merge equal-valued
+        // arguments and congruence over the application can fire.
+        let term = self.abstract_compound_bool_args(term, manager);
+
         let index = self.assertions.len();
         self.assertions.push(term);
         self.trail.push(TrailOp::AssertionAdded { index });
@@ -1055,6 +1060,69 @@ impl Solver {
             let not_c = manager.mk_not(c_sub);
             side.push(manager.mk_implies(c_sub, eq_v_t));
             side.push(manager.mk_implies(not_c, eq_v_e));
+        }
+        let rewritten = manager.substitute(term, &map);
+        let mut parts = side;
+        parts.insert(0, rewritten);
+        manager.mk_and(parts)
+    }
+
+    /// Abstract compound Bool subterms that appear as (or under) uninterpreted-
+    /// function arguments, replacing each with a fresh Bool variable plus a
+    /// defining equality.
+    ///
+    /// EUF congruence compares applications by their arguments' classes, and Bool
+    /// completion merges Bool *variables* with canonical true/false by SAT
+    /// value. A compound Bool argument such as `(and a b)` is neither a variable
+    /// (so not completed) nor encoded as a SAT atom when the application is a
+    /// theory term the theory interns directly. Two such arguments that are
+    /// logically equal but syntactically distinct never merge, and congruence
+    /// over the application never fires — a false-SAT. Abstracting each to a
+    /// fresh variable `v` with `(= v (and a b))` makes the argument a variable
+    /// (now completed) while the defining equality ties `v` to the gate. Bool
+    /// variables and Bool applications are left alone (already handled).
+    pub(super) fn abstract_compound_bool_args(
+        &mut self,
+        term: TermId,
+        manager: &mut TermManager,
+    ) -> TermId {
+        use oxiz_core::ast::collect_subterms;
+        use rustc_hash::FxHashMap;
+
+        let bool_sort = manager.sorts.bool_sort;
+        let mut to_abstract: Vec<TermId> = Vec::new();
+        // Identify compound Bool terms that are arguments of some Apply.
+        for st in collect_subterms(term, manager) {
+            let Some(t) = manager.get(st) else {
+                continue;
+            };
+            if let TermKind::Apply { args, .. } = &t.kind {
+                for &arg in args {
+                    let Some(at) = manager.get(arg) else {
+                        continue;
+                    };
+                    if at.sort == bool_sort
+                        && !matches!(at.kind, TermKind::Var(_) | TermKind::Apply { .. })
+                    {
+                        to_abstract.push(arg);
+                    }
+                }
+            }
+        }
+        if to_abstract.is_empty() {
+            return term;
+        }
+        let mut map: FxHashMap<TermId, TermId> = FxHashMap::default();
+        for arg in to_abstract {
+            if map.contains_key(&arg) {
+                continue;
+            }
+            let v = manager.mk_var(&format!("__oxiz_boolarg_{}", arg.0), bool_sort);
+            map.insert(arg, v);
+        }
+        let mut side: Vec<TermId> = Vec::with_capacity(map.len());
+        for (arg, v) in &map {
+            side.push(manager.mk_eq(*v, *arg));
         }
         let rewritten = manager.substitute(term, &map);
         let mut parts = side;
