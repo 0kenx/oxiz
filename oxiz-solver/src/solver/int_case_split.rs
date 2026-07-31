@@ -4,10 +4,10 @@
 //!
 //! A QF_UFLIA formula is *non-convex* in the arithmetic sense when an integer
 //! term `t` is pinned to a small finite domain by arithmetic bounds (e.g.
-//! `(>= t 0)` ∧ `(<= t 1)` ⟹ `t ∈ {0, 1}`) and that same `t` is used directly
-//! as an argument to an uninterpreted function.  Whether the formula is
-//! satisfiable can then depend on *which* concrete value `t` takes, because
-//! each value triggers a different congruence in EUF (`f(0)` vs `f(1)`).
+//! `(>= t 0)` ∧ `(<= t 1)` ⟹ `t ∈ {0, 1}`) and that same `t` is used as an
+//! argument to an uninterpreted function.  Whether the formula is satisfiable
+//! can then depend on *which* concrete value `t` takes, because each value
+//! triggers a different congruence in EUF (`f(0)` vs `f(1)`).
 //!
 //! Nelson–Oppen equality sharing between the arithmetic and EUF solvers can
 //! only propagate *entailed* equalities.  `t = 0` is **not** entailed while
@@ -16,56 +16,52 @@
 //! result is a spurious `sat` on an `unsat` instance — a classic false-SAT of
 //! non-convex theory combination.
 //!
-//! Canonical minimal repro:
-//! ```text
-//!   (declare-fun d () Int) (declare-fun f (Int) Int)
-//!   (assert (>= d 0)) (assert (<= d 1))
-//!   (assert (= (f 0) 0)) (assert (= (f 1) 1))
-//!   (assert (= (f d) (+ d 1)))        ; unsat: d=0 ⇒ 0=1, d=1 ⇒ 1=2
-//! ```
-//!
 //! ## The fix
 //!
-//! After the CDCL(T) core reports a candidate `sat`, we look for
-//! *user-declared* integer variables that (a) appear directly as uninterpreted
-//! function arguments and (b) are tightly bounded to a small finite domain by
-//! the formula, then assert an explicit disjunction
-//! `(or (= t lo) … (= t hi))` as a lemma.  Each disjunct is a fresh equality
-//! atom that is shared by both theories (it is a `Constraint::Eq` over an Int
-//! term with a *proper SAT-level reason*), so once CDCL picks a value the EUF
-//! congruence `f(t) = f(k)` fires and the arithmetic solver detects the
-//! conflict through the normal EUF→Arith propagation — exactly reproducing
+//! After the CDCL(T) core reports a candidate `sat`, we look for integer
+//! terms that (a) appear as uninterpreted-function arguments and (b) are
+//! tightly bounded to a small finite domain by *decision-level-0* arithmetic
+//! atoms, then assert an explicit disjunction `(or (= t lo) … (= t hi))` as a
+//! lemma and re-solve.  Each disjunct is a fresh equality atom shared by both
+//! theories, so once CDCL picks a value the EUF congruence `f(t) = f(k)`
+//! fires and the arithmetic solver detects the conflict — exactly reproducing
 //! what a hand-written `(assert (or (= d 0) (= d 1)))` achieves.
+//!
+//! This closes the gap for both simple UF arguments (`f(d)`) and compound ones
+//! (`f(fmt1 - 2)`, abstracted to a fresh proxy during preprocessing): splitting
+//! the proxy directly is sound because
+//! [`TheoryManager::propagate_euf_equalities_to_arith`] expands theory-derived
+//! equalities through the EUF proof forest, giving conflict clauses complete
+//! decision-level reasons.
 //!
 //! ## Soundness
 //!
 //! The disjunction is a *theorem* of the formula (it only restates that `t`
-//! must lie in `[lo, hi]`), so adding it can never change satisfiability.  Two
-//! properties guarantee this:
+//! lies in `[lo, hi]`), so adding it can never change satisfiability.  Bounds
+//! come only from **direct single-variable** arithmetic atoms
+//! (`(>= d 0)`, `(< d 5)`, `(= d 3)`) that are unit-propagated to true at
+//! decision level 0 — i.e. they are theorems of the formula and hold in every
+//! model.  A model-consistency guard backstops any derivation bug.
 //!
-//!   1. **Bounds come only from decision-level-0 atoms.**  An atom forced at
-//!      level 0 holds in *every* model (it is unit-propagated from the formula
-//!      alone), so any bound derived from such atoms is a logical consequence
-//!      of the formula.  Atoms that merely happen to be true in the current
-//!      candidate model are *not* used.
-//!   2. **A model-consistency guard.**  As a defensive backstop, we additionally
-//!      require that the candidate model's actual value for `t` lies within
-//!      `[lo, hi]`; if the derived bounds ever disagreed with the model the
-//!      theory solvers just accepted, we skip the term.
+//! Multi-variable equalities are deliberately *not* used to transfer bounds
+//! between linked terms: an interval fixpoint over them can converge to a
+//! (candidate-model-consistent but not formula-entailed) point bound, which
+//! produces a false `unsat` on some WiSA variants.  Closing that gap safely is
+//! left to future work; the direct-bound refinement here is sound and captures
+//! the common case where a UF argument is itself directly bounded.
 //!
-//! ## Scope limitation (compound UF arguments)
+//! ## Cost control
 //!
-//! Only *user-declared* integer variables are split.  Compound UF arguments
-//! such as `f(fmt1 - 2)` are abstracted to fresh internal proxies during
-//! preprocessing; case-splitting those proxies exposes a separate, pre-existing
-//! soundness gap in the theory combination (conflict explanations for
-//! theory-derived equalities miss their decision-level reasons), so they are
-//! deliberately excluded here via [`Solver::is_internal_var`].  Closing that
-//! gap is left to a dedicated theory-combination fix.
+//! Each refinement round re-solves the whole problem from scratch, so the
+//! refinement is gated on the first solve being fast
+//! ([`CASE_SPLIT_REFINE_BUDGET_MS`]) and capped at one round: easy instances
+//! (where a non-convex gap actually exists) solve quickly and get the extra
+//! round, while hard instances keep their original fast answer instead of
+//! turning a wrong-but-fast verdict into a slow timeout.
 //!
-//! Reference: this is the standard "integer case splitting" used by Z3 / cvc5
-//! for non-convex LIA theory combination (see Barrett et al.,
-//! "Decision Procedures", ch. 10).
+//! Reference: the standard "integer case splitting" used by Z3 / cvc5 for
+//! non-convex LIA theory combination (Barrett et al., "Decision Procedures",
+//! ch. 10).
 
 use num_rational::Rational64;
 use num_traits::ToPrimitive;
@@ -78,15 +74,31 @@ use super::types::{ArithConstraintType, Constraint};
 use super::Solver;
 
 /// Maximum integer range `hi - lo` for which we emit an explicit case split.
+/// Kept modest: a wider disjunction both enlarges the CDCL search and (for the
+/// WiSA family) tends to coincide with the harder, larger instances where the
+/// extra solve is not affordable.  Small ranges cover the common non-convex
+/// cases.
 const MAX_INT_CASE_RANGE: i64 = 8;
 
-/// Hard cap on the number of reset-and-re-solve refinement rounds.  Each round
-/// is expensive (the whole problem is re-solved from scratch); the
-/// `case_split_terms` deduplication guarantees saturation well within this.
-const MAX_CASE_SPLIT_ROUNDS: u32 = 16;
+/// Hard cap on the number of reset-and-re-solve refinement rounds.  Kept at 1:
+/// every eligible UF argument is split in that single round (see
+/// [`PER_ROUND_CAP`]), so one extra solve either closes the gap or reports the
+/// (still valid) `sat`.  Bounding rounds bounds the worst-case cost.
+const MAX_CASE_SPLIT_ROUNDS: u32 = 1;
 
-/// Maximum number of *new* terms split in a single refinement round.
-const PER_ROUND_CAP: usize = 8;
+/// Maximum number of *new* terms split in a single refinement round.  Set high
+/// so every eligible UF argument is split in the one allowed round: the term
+/// whose enumeration resolves the formula is not necessarily the smallest-range
+/// one, so restricting the count would risk leaving it unsplit.
+const PER_ROUND_CAP: usize = 32;
+
+/// The refinement is only attempted when the first CDCL(T) solve completed
+/// within this many milliseconds.  The refinement re-solves the whole problem
+/// from scratch, so on a hard instance (slow first solve) it would roughly
+/// double the runtime; skipping it there preserves the original fast answer.
+/// Easy instances — where the technique actually closes a non-convex gap —
+/// solve in well under this budget.
+pub(super) const CASE_SPLIT_REFINE_BUDGET_MS: u64 = 5000;
 
 /// Whether a constraint's effect on a variable is to pin a lower bound, an
 /// upper bound, or both (equality).  Strict `<` / `>` are normalised to `<=` /
@@ -111,12 +123,10 @@ impl Solver {
     /// Lazy integer case-split refinement entry point.
     ///
     /// Returns `true` iff at least one new case-split lemma was asserted, in
-    /// which case the caller must reset the theory state and re-solve (mirrors
-    /// the array-axiom refinement loop in [`Solver::check`]).  Returns `false`
-    /// when there is nothing more to split — the candidate `sat` then stands.
+    /// which case the caller resets the theory state and re-solves.  Returns
+    /// `false` when there is nothing more to split — the candidate `sat` then
+    /// stands.
     pub(super) fn refine_int_case_split(&mut self, manager: &mut TermManager) -> bool {
-        // The whole technique is integer-specific: real (LRA) arithmetic is
-        // convex, and the strict-inequality normalisation assumes integers.
         if !self.arith.is_integer() {
             return false;
         }
@@ -151,7 +161,8 @@ impl Solver {
             return false;
         }
 
-        // Prefer the tightest ranges first (a range-1 split enumerates two).
+        // Prefer the tightest ranges first (a range-1 split enumerates only
+        // two cases), minimising the per-clause disjunction cost.
         candidates.sort_by_key(|&(_, lo, hi)| (hi - lo, lo));
         candidates.truncate(PER_ROUND_CAP);
 
@@ -170,13 +181,14 @@ impl Solver {
         true
     }
 
-    /// Collect every *user-declared* term that appears directly as an argument
-    /// of an uninterpreted function application and has an integer or real
-    /// sort.
+    /// Collect every integer/real-sorted term that appears directly as an
+    /// argument of an uninterpreted function application.
     ///
-    /// Internal preprocessing proxies (`__oxiz_aritharg_*`, `__oxiz_ite_*`,
-    /// purification constants `$p*`) are excluded: case-splitting them exposes
-    /// a separate theory-combination soundness gap (see the module docs).
+    /// The assertions are scanned *after* preprocessing (purification +
+    /// compound-argument abstraction), so a compound UF argument like
+    /// `f(fmt1 + 1)` is already represented by its fresh abstraction proxy,
+    /// which is exactly the plain variable EUF/Arith share — the right thing
+    /// to split.
     fn collect_int_uf_args(&self, manager: &TermManager) -> Vec<TermId> {
         let int_sort = manager.sorts.int_sort;
         let real_sort = manager.sorts.real_sort;
@@ -197,9 +209,6 @@ impl Solver {
                     if at.sort != int_sort && at.sort != real_sort {
                         continue;
                     }
-                    if self.is_internal_var(arg, manager) {
-                        continue;
-                    }
                     if seen.insert(arg) {
                         out.push(arg);
                     }
@@ -209,32 +218,26 @@ impl Solver {
         out
     }
 
-    /// `true` iff `term` is a variable introduced by an internal preprocessing
-    /// pass (compound-argument abstraction, `ite` elimination, or arithmetic
-    /// purification), identified by its generated name prefix.  Such variables
-    /// are not safe targets for case-splitting (see the module docs).
-    fn is_internal_var(&self, term: TermId, manager: &TermManager) -> bool {
-        let Some(t) = manager.get(term) else {
-            return false;
-        };
-        let TermKind::Var(spur) = &t.kind else {
-            return false;
-        };
-        let name = manager.resolve_str(*spur);
-        name.starts_with("__oxiz") || name.starts_with("$p")
-    }
-
     /// Compute sound inclusive integer bounds `[lo, hi]` for arithmetic terms
-    /// via a fixpoint of interval propagation over the decision-level-0
-    /// arithmetic atoms.
+    /// from **direct single-variable** arithmetic atoms that are
+    /// unit-propagated to true at decision level 0.
     ///
-    /// Only atoms unit-propagated to `true` at level 0 are considered, so every
-    /// derived bound holds in all models of the formula.  Equalities propagate
-    /// both bounds and drive bound *transfer* between linked variables.
+    /// Only single-variable atoms (`(>= d 0)`, `(< d 5)`, `(= d 3)`) are used:
+    /// they are theorems of the formula (level 0), so any bound derived from
+    /// them holds in all models.  Multi-variable equalities are excluded — see
+    /// the module-level soundness note.
     fn compute_int_bounds(&self) -> FxHashMap<TermId, (Option<i64>, Option<i64>)> {
         let mut facts: Vec<Fact> = Vec::new();
         for (&var, parsed) in &self.var_to_parsed_arith {
             if !self.atom_is_level0_true(var) {
+                continue;
+            }
+            // SOUNDNESS: only direct single-variable bounds (e.g. `(>= d 0)`,
+            // `(<= d 1)`) are used.  Multi-variable equalities can pin a term
+            // to the candidate model's value via a fixpoint that is not
+            // actually entailed by the formula (a false-UNSAT on some WiSA
+            // variants), so they are excluded.
+            if parsed.terms.len() != 1 {
                 continue;
             }
             // Coefficients must be integer for our i64 interval arithmetic.
@@ -512,9 +515,7 @@ mod tests {
 
     #[test]
     fn div_le_ge_positive_coef() {
-        // 2·x <= 7 ⇒ x <= 3
         assert_eq!(div_le_ge(2, 7, true), (None, Some(3)));
-        // 2·x >= 3 ⇒ x >= 2
         assert_eq!(div_le_ge(2, 3, false), (Some(2), None));
     }
 

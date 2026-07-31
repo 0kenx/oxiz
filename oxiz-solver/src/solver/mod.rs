@@ -893,6 +893,15 @@ impl Solver {
         let max_array_refinement_rounds = 256;
         let mut array_refinement_rounds = 0;
 
+        // Stamp the start of the search so the non-convex-LIA case-split
+        // refinement can be gated on how long the first solve took: the
+        // refinement re-solves the whole problem from scratch, so it is only
+        // affordable when the first solve was fast.  On a slow (hard) instance
+        // we skip it rather than blow the time budget and turn a fast wrong
+        // answer into a slow timeout.
+        #[cfg(feature = "std")]
+        let check_start = std::time::Instant::now();
+
         loop {
             // Enforce the wall-clock timeout between MBQI rounds.  Mid-`solve`
             // enforcement lives in the theory callbacks (see TheoryManager).
@@ -959,8 +968,26 @@ impl Solver {
                         // genuine `unsat` is wrongly reported `sat`.  Emit an
                         // explicit `(or (= t lo) … (= t hi))` lemma for each
                         // such term and re-solve.  See
-                        // [`Solver::refine_int_case_split`].
-                        if self.refine_int_case_split(manager) {
+                        // [`Solver::refine_int_case_split`].  Gated on the
+                        // first solve being fast: the refinement re-solves the
+                        // whole problem from scratch, so on a slow (hard)
+                        // instance we skip it rather than blow the time budget.
+                        #[cfg(feature = "std")]
+                        let case_split_affordable = check_start.elapsed()
+                            < std::time::Duration::from_millis(
+                                int_case_split::CASE_SPLIT_REFINE_BUDGET_MS,
+                            );
+                        #[cfg(not(feature = "std"))]
+                        let case_split_affordable = true;
+                        if case_split_affordable && self.refine_int_case_split(manager) {
+                            // Re-solve with the freshly asserted case-split
+                            // lemmas from a clean state.  `add_clause` left the
+                            // SAT core at the candidate model's trail; the
+                            // incremental theory solvers still hold that
+                            // model's facts, which cannot be surgically undone
+                            // (only level-scoped pops), so we drop the trail to
+                            // root and reset the three theory solvers.  The fresh
+                            // `TheoryManager` then re-drives them from scratch.
                             self.sat.backtrack_to_root();
                             self.euf.reset();
                             self.arith.reset();
