@@ -1273,6 +1273,11 @@ impl Solver {
         }
     }
 
+    /// Install (or replace) an external branching heuristic.
+    pub fn set_external_branching(&mut self, h: crate::solver::BoxedBranchingHeuristic) {
+        self.config.external_branching = Some(h);
+    }
+
     /// Returns `true` when the search must stop early: the conflict budget has
     /// been reached or an external interrupt flag has been raised.
     #[inline]

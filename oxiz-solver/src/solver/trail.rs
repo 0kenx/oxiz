@@ -181,6 +181,10 @@ impl super::Solver {
             // a stale entry only makes a domain split inherit a *valid* (possibly
             // redundant) bound, so it is sound to leave it (cleared only by
             // `reset`).
+            table_index_key_score: _, // accumulates per-key payload scores used only
+            // to order VSIDS bumps; a stale entry only re-orders a *valid*
+            // branching hint, so it is sound to leave it (cleared only by
+            // `reset`).
             dt_var_constructors: _,      // TRAIL: DtVarConstructorAdded
             arith_parse_cache: _,        // INVARIANT: keyed by term structure
             tracked_compound_terms: _,   // TRAIL: TrackedCompoundAdded

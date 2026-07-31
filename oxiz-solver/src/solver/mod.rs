@@ -173,6 +173,10 @@ pub struct Solver {
     /// sides to the named variable so bounds on `name` apply to inlined `body`
     /// table indices (EM inlines Discord's body at parse time).
     pub(super) unit_eq_rep: FxHashMap<TermId, TermId>,
+    /// Heuristic score for domain value `k` of table index `idx`: sum of
+    /// absolute constant payloads at that key across flattened tables.  Used to
+    /// VSIDS-bump high-value domain equalities first (e.g. R9-heavy indices).
+    pub(super) table_index_key_score: FxHashMap<TermId, FxHashMap<i64, i64>>,
     /// Datatype constructor constraints: variable -> constructor name
     /// Used to detect mutual exclusivity conflicts (var = C1 AND var = C2 where C1 != C2)
     pub(super) dt_var_constructors: FxHashMap<TermId, oxiz_core::interner::Spur>,
@@ -432,6 +436,7 @@ impl Solver {
             zero_one_terms: FxHashSet::default(),
             table_index_keys: FxHashMap::default(),
             unit_eq_rep: FxHashMap::default(),
+            table_index_key_score: FxHashMap::default(),
             dt_var_constructors: FxHashMap::default(),
             arith_parse_cache: FxHashMap::default(),
             tracked_compound_terms: FxHashSet::default(),
@@ -2156,6 +2161,7 @@ impl Solver {
         self.zero_one_terms.clear();
         self.table_index_keys.clear();
         self.unit_eq_rep.clear();
+        self.table_index_key_score.clear();
         self.dt_var_constructors.clear();
         self.arith_parse_cache.clear();
         self.tracked_compound_terms.clear();

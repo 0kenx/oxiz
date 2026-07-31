@@ -14,14 +14,38 @@
 //!
 //! so nested tool-generated nests unit-propagate / collapse once indices pin.
 
+use std::sync::{Arc, Mutex};
+
 use num_traits::ToPrimitive;
 use oxiz_core::ast::{TermId, TermKind, TermManager, collect_subterms};
 use oxiz_core::sort::SortId;
-use oxiz_sat::Lit;
+use oxiz_sat::{BranchingHeuristic, Lit, Var};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::types::Constraint;
 use super::Solver;
+
+/// Prefer finite-domain table-index equalities over the rest of the search space.
+struct DomainFirstBranching {
+    /// var index → payload heuristic score (higher first)
+    domain_scores: FxHashMap<u32, i64>,
+}
+
+impl BranchingHeuristic for DomainFirstBranching {
+    fn select(&mut self, candidates: &[Var], _scores: &[f64]) -> Option<Var> {
+        let mut best: Option<Var> = None;
+        let mut best_sc = i64::MIN;
+        for &v in candidates {
+            if let Some(&sc) = self.domain_scores.get(&(v.index() as u32)) {
+                if sc > best_sc {
+                    best_sc = sc;
+                    best = Some(v);
+                }
+            }
+        }
+        best
+    }
+}
 
 const MIN_TABLE_CASES: usize = 4;
 const MAX_EAGER_TABLE_DOMAIN: i64 = 64;
@@ -102,7 +126,25 @@ impl Solver {
                 side.push(manager.mk_implies(eq_idx, eq_r));
                 not_cases.push(manager.mk_not(eq_idx));
                 match int_const_val(then_br, manager) {
-                    Some(v) => const_vals.push(v),
+                    Some(v) => {
+                        const_vals.push(v);
+                        // Accumulate |payload| for domain branching heuristic.
+                        let rep = self.unit_eq_rep.get(&m.index).copied().unwrap_or(m.index);
+                        let e = self
+                            .table_index_key_score
+                            .entry(rep)
+                            .or_default()
+                            .entry(k)
+                            .or_insert(0);
+                        *e = e.saturating_add(v.unsigned_abs() as i64);
+                        let e2 = self
+                            .table_index_key_score
+                            .entry(m.index)
+                            .or_default()
+                            .entry(k)
+                            .or_insert(0);
+                        *e2 = e2.saturating_add(v.unsigned_abs() as i64);
+                    }
                     None => all_const = false,
                 }
             }
@@ -348,6 +390,8 @@ impl Solver {
             by_rep.entry(rep).or_default().push(idx);
         }
 
+        let mut domain_branch_scores: FxHashMap<u32, i64> = FxHashMap::default();
+
         for (rep, idxs) in by_rep {
             if self.case_split_terms.contains(&rep) {
                 // Still bridge any new idx aliases.
@@ -451,13 +495,18 @@ impl Solver {
                         .add_clause([lits[i].negate(), lits[j].negate()]);
                 }
             }
-            // Decide domain equalities early (large bump for small domains).
-            let bump = if vals.len() <= 8 { 64 } else { 16 };
-            for &lit in &lits {
-                self.sat.bump_var_activity(lit.var(), bump);
-                // Prefer trying a value (true) first — any consistent pick
-                // collapses tables via unit prop.
+            // Decide domain equalities early; weight by table payload so
+            // high-value keys (e.g. R9 scores) are tried first.
+            let scores = self.table_index_key_score.get(&rep).cloned().unwrap_or_default();
+            let max_score = scores.values().copied().max().unwrap_or(0).max(1);
+            for &(k, lit) in &pairs {
+                let sc = scores.get(&k).copied().unwrap_or(0);
+                // Base bump + up to 128 extra proportional to payload share.
+                let base = if vals.len() <= 8 { 48 } else { 12 };
+                let extra = ((sc as u128 * 128) / max_score as u128) as u32;
+                self.sat.bump_var_activity(lit.var(), base + extra);
                 self.sat.set_preferred_phase(lit.var(), true);
+                domain_branch_scores.insert(lit.var().index() as u32, sc);
             }
             self.table_index_domain_eqs.insert(rep, pairs.clone());
             self.case_split_terms.insert(rep);
@@ -467,6 +516,14 @@ impl Solver {
                     self.bridge_index_to_rep(idx, &pairs, manager, dbg);
                 }
             }
+        }
+
+        if !domain_branch_scores.is_empty() {
+            let h = DomainFirstBranching {
+                domain_scores: domain_branch_scores,
+            };
+            self.sat
+                .set_external_branching(Arc::new(Mutex::new(h)));
         }
     }
 
