@@ -108,6 +108,19 @@ impl EufSolver {
         }
     }
 
+    /// Hand out the next derivation-order stamp. Both directed edges of a single
+    /// merge must share one stamp, so callers take it once per merge. Saturates
+    /// instead of wrapping: a wrap would make old edges look newer than recent
+    /// ones and break the derivation order `try_explain_equality` depends on.
+    /// Saturation only makes the last stamps compare equal, which costs
+    /// explanation quality rather than soundness, and is unreachable in practice.
+    #[inline]
+    fn next_proof_stamp(&mut self) -> u32 {
+        let s = self.proof_stamp;
+        self.proof_stamp = self.proof_stamp.saturating_add(1);
+        s
+    }
+
     /// Append `entry` to `node`'s use-list, recording the append on
     /// `use_list_trail` when a scope is active so `pop()` can remove it.
     #[inline]
@@ -280,14 +293,23 @@ impl EufSolver {
             // forest with two distinct paths between the same pair of nodes, and
             // `explain_equality`'s path search could then justify a congruence by a
             // route that runs through the very edge being explained.
+            let stamp = self.next_proof_stamp();
             self.add_proof_edge(
                 a,
                 MergeEdge {
                     other: b,
                     reason: reason.clone(),
+                    stamp,
                 },
             );
-            self.add_proof_edge(b, MergeEdge { other: a, reason });
+            self.add_proof_edge(
+                b,
+                MergeEdge {
+                    other: a,
+                    reason,
+                    stamp,
+                },
+            );
             // The forest just grew an edge, so every cached explanation may now be
             // longer than the shortest path.  Drop the cache rather than serve a
             // stale (still sound, but needlessly large) answer.

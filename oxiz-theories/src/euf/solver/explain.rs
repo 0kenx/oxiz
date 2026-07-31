@@ -180,9 +180,19 @@ impl EufSolver {
 
         // Take reusable buffers out of self so the shared reads on `self.nodes`,
         // `self.proof_forest` and `self.uf` below do not conflict with them.
-        let mut queue = mem::take(&mut self.explain_queue);
-        let mut visited = mem::take(&mut self.explain_visited);
+        let mut settled = mem::take(&mut self.explain_visited);
+        let mut seen_gen = mem::take(&mut self.explain_seen_gen);
+        let mut dist = mem::take(&mut self.explain_dist);
+        let mut heap = mem::take(&mut self.explain_heap);
         let mut parent = mem::take(&mut self.explain_parent);
+        // Generation stamps never wrap in practice; roll the buffers over
+        // defensively so a wrap can never make stale entries look live.
+        if self.explain_generation >= u32::MAX - 1 {
+            self.explain_generation = 0;
+            settled.iter_mut().for_each(|v| *v = 0);
+            seen_gen.iter_mut().for_each(|v| *v = 0);
+        }
+        let mut generation = self.explain_generation;
         let mut todo = mem::take(&mut self.explain_todo);
         let mut enqueued = mem::take(&mut self.explain_enqueued);
 
@@ -197,19 +207,36 @@ impl EufSolver {
         let mut complete = true;
 
         'goals: while let Some((from, to)) = todo.pop() {
-            // Reset / resize in-place — existing heap capacity is retained.
-            queue.clear();
-            visited.clear();
-            visited.resize(n, false);
-            parent.clear();
-            parent.resize(n, None);
-
-            // BFS for a path from `from` to `to` through the proof forest.
-            queue.push_back(from);
-            visited[from as usize] = true;
+            // Bottleneck (minimax) search: among all paths from -> to, take one
+            // whose *latest* edge is as early as possible (smallest max stamp).
+            // Plain BFS minimises hop count instead, and a short path may route
+            // through merges made long after `from = to` was already derived —
+            // exactly the circular route that used to produce truncated
+            // explanations and spurious UNSAT. Minimising the maximum stamp
+            // reconstructs the derivation-time path, so every congruence edge on
+            // it is justified strictly earlier (well-founded recursion).
+            //
+            // The per-node tables are generation-stamped rather than cleared: one
+            // conflict explanation runs this search once per pair on the worklist,
+            // and re-zeroing O(nodes) entries each time dominated the whole solver.
+            if dist.len() < n {
+                dist.resize(n, u64::MAX);
+                parent.resize(n, None);
+                settled.resize(n, 0);
+                seen_gen.resize(n, 0);
+            }
+            generation += 1;
+            heap.clear();
+            dist[from as usize] = 0;
+            seen_gen[from as usize] = generation;
+            heap.push(core::cmp::Reverse((0u64, from)));
 
             let mut found = false;
-            while let Some(node) = queue.pop_front() {
+            while let Some(core::cmp::Reverse((d, node))) = heap.pop() {
+                if settled[node as usize] == generation {
+                    continue;
+                }
+                settled[node as usize] = generation;
                 if node == to {
                     found = true;
                     break;
@@ -220,10 +247,24 @@ impl EufSolver {
                 };
                 for (idx, edge) in edges.iter().enumerate() {
                     let other_idx = edge.other as usize;
-                    if other_idx < n && !visited[other_idx] {
-                        visited[other_idx] = true;
+                    if other_idx >= n || settled[other_idx] == generation {
+                        continue;
+                    }
+                    // Lexicographic relaxation: first minimise the latest stamp on
+                    // the path (soundness), then the hop count (small reason set).
+                    let nd_stamp = ((d >> 32) as u32).max(edge.stamp);
+                    let nd_hops = (d as u32) + 1;
+                    let nd = (u64::from(nd_stamp) << 32) | u64::from(nd_hops);
+                    let known = if seen_gen[other_idx] == generation {
+                        dist[other_idx]
+                    } else {
+                        u64::MAX
+                    };
+                    if nd < known {
+                        seen_gen[other_idx] = generation;
+                        dist[other_idx] = nd;
                         parent[other_idx] = Some((node, idx));
-                        queue.push_back(edge.other);
+                        heap.push(core::cmp::Reverse((nd, edge.other)));
                     }
                 }
             }
@@ -241,10 +282,18 @@ impl EufSolver {
                 break 'goals;
             }
 
-            // Walk the parent chain back from `to` to `from`.
+            // Walk the parent chain back from `to` to `from`. Stop at `from`
+            // (its parent may be a leftover from an earlier generation) and guard
+            // on the generation stamp so a stale entry never sends us off-path.
             path.clear();
             let mut current = to;
-            while let Some((prev, edge_idx)) = parent[current as usize] {
+            while current != from {
+                if seen_gen[current as usize] != generation {
+                    break;
+                }
+                let Some((prev, edge_idx)) = parent[current as usize] else {
+                    break;
+                };
                 path.push((prev, edge_idx));
                 current = prev;
             }
@@ -325,8 +374,11 @@ impl EufSolver {
 
         // Restore buffers so the next call reuses their capacity — on the failure
         // path too, otherwise a single failure would strand them empty forever.
-        self.explain_queue = queue;
-        self.explain_visited = visited;
+        self.explain_generation = generation;
+        self.explain_visited = settled;
+        self.explain_seen_gen = seen_gen;
+        self.explain_dist = dist;
+        self.explain_heap = heap;
         self.explain_parent = parent;
         self.explain_todo = todo;
         self.explain_enqueued = enqueued;

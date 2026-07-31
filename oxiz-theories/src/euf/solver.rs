@@ -204,6 +204,11 @@ struct MergeEdge {
     other: u32,
     /// The reason for the merge
     reason: MergeReason,
+    /// Derivation-order timestamp: both directed edges of one merge share it,
+    /// and it is strictly greater than the stamp of every edge that justified
+    /// the merge. `try_explain_equality` picks the path that minimises this
+    /// value to keep explanations acyclic (earliest-path / bottleneck search).
+    stamp: u32,
 }
 
 /// EUF Theory Solver using congruence closure
@@ -314,10 +319,22 @@ pub struct EufSolver {
     use_list_trail: Vec<u32>,
     /// Scope checkpoints into use_list_trail, parallel to sig_trail_limits.
     use_list_trail_limits: Vec<usize>,
-    /// Reusable BFS queue for explain_equality — avoids per-call VecDeque allocation.
-    explain_queue: crate::prelude::VecDeque<u32>,
-    /// Reusable visited flags for explain_equality — resized to proof_forest.len() and cleared at entry.
-    explain_visited: Vec<bool>,
+    /// Reusable settled markers for try_explain_equality's bottleneck search,
+    /// stamped with `explain_generation` instead of cleared between searches.
+    explain_visited: Vec<u32>,
+    /// Generation stamps marking which `explain_dist`/`explain_parent` entries
+    /// belong to the search currently running.
+    explain_seen_gen: Vec<u32>,
+    /// Monotonic generation counter for the stamped explain buffers.
+    explain_generation: u32,
+    /// Reusable distance table for try_explain_equality. Each entry packs the
+    /// lexicographic cost `(max_edge_stamp << 32) | hop_count` of the best known
+    /// path from the source, so ties on the bottleneck break by shortest path —
+    /// an earliest *and* compact explanation.
+    explain_dist: Vec<u64>,
+    /// Reusable priority queue for try_explain_equality's search, ordered by
+    /// `(packed_cost, node)` ascending.
+    explain_heap: crate::prelude::BinaryHeap<core::cmp::Reverse<(u64, u32)>>,
     /// Reusable parent-pointer table for explain_equality — parallel to explain_visited.
     explain_parent: Vec<Option<(u32, usize)>>,
     /// Reusable worklist of node pairs whose equality still has to be explained.
@@ -339,6 +356,10 @@ pub struct EufSolver {
     /// eagerly whenever an edge is added (`propagate`), removed (`pop`), or the
     /// whole solver is `reset`, so a stale entry can never be observed.
     expl_cache: crate::lru_cache::LruCache<(u32, u32), Vec<TermId>>,
+    /// Monotonic counter handing out `MergeEdge::stamp` values in derivation
+    /// order. Never rewound on `pop()`: edges re-added after a backtrack are
+    /// genuinely derived later, so larger stamps keep the invariant intact.
+    proof_stamp: u32,
 }
 
 /// State to save for push/pop
@@ -384,12 +405,16 @@ impl EufSolver {
             proof_trail_limits: Vec::new(),
             use_list_trail: Vec::new(),
             use_list_trail_limits: Vec::new(),
-            explain_queue: crate::prelude::VecDeque::new(),
             explain_visited: Vec::new(),
+            explain_seen_gen: Vec::new(),
+            explain_generation: 0,
+            explain_dist: Vec::new(),
+            explain_heap: crate::prelude::BinaryHeap::new(),
             explain_parent: Vec::new(),
             explain_todo: Vec::new(),
             explain_enqueued: FxHashSet::default(),
             expl_cache: crate::lru_cache::LruCache::new(EUF_EXPL_CACHE_CAPACITY),
+            proof_stamp: 0,
         }
     }
 
@@ -941,5 +966,7 @@ impl Theory for EufSolver {
         self.explain_todo.clear();
         self.explain_enqueued.clear();
         self.expl_cache.clear();
+        // The proof forest is gone, so derivation order restarts from zero.
+        self.proof_stamp = 0;
     }
 }
