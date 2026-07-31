@@ -1259,6 +1259,20 @@ impl Solver {
         }
     }
 
+    /// Raise VSIDS activity so `var` is decided early.
+    ///
+    /// Used after finite-domain case-splits on table indices: once those
+    /// equalities are fixed, lookup tables unit-propagate and the remaining
+    /// arithmetic is nearly determined.
+    pub fn bump_var_activity(&mut self, var: Var, times: u32) {
+        if !self.vsids.contains(var) {
+            self.vsids.insert(var);
+        }
+        for _ in 0..times {
+            self.vsids.bump(var);
+        }
+    }
+
     /// Returns `true` when the search must stop early: the conflict budget has
     /// been reached or an external interrupt flag has been raised.
     #[inline]

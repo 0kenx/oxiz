@@ -261,6 +261,33 @@ impl Solver {
         cur
     }
 
+    /// Rewrite inlined define-fun bodies to their named representative vars.
+    ///
+    /// The SMT-LIB parser expands nullary `define-fun` at every use site.  After
+    /// we have processed `(= Name body)`, subsequent assertions that still carry
+    /// the raw `body` DAG should mention `Name` instead — otherwise Discord/EM/R
+    /// are re-flattened on every mention (catastrophic on qi_1_h1).
+    pub(super) fn fold_unit_eq_reps(
+        &mut self,
+        term: TermId,
+        manager: &mut TermManager,
+    ) -> TermId {
+        if self.unit_eq_rep.is_empty() {
+            return term;
+        }
+        let mut map: FxHashMap<TermId, TermId> = FxHashMap::default();
+        for (&body, &rep) in &self.unit_eq_rep {
+            if body != rep {
+                map.insert(body, rep);
+            }
+        }
+        if map.is_empty() {
+            term
+        } else {
+            manager.substitute(term, &map)
+        }
+    }
+
     /// Record unit top-level `(= var t)` so bounds on `var` apply to `t`.
     pub(super) fn note_unit_eq_alias(&mut self, term: TermId, manager: &TermManager) {
         // Peel a top-level and to find bare equalities.
@@ -423,6 +450,14 @@ impl Solver {
                     self.sat
                         .add_clause([lits[i].negate(), lits[j].negate()]);
                 }
+            }
+            // Decide domain equalities early (large bump for small domains).
+            let bump = if vals.len() <= 8 { 64 } else { 16 };
+            for &lit in &lits {
+                self.sat.bump_var_activity(lit.var(), bump);
+                // Prefer trying a value (true) first — any consistent pick
+                // collapses tables via unit prop.
+                self.sat.set_preferred_phase(lit.var(), true);
             }
             self.table_index_domain_eqs.insert(rep, pairs.clone());
             self.case_split_terms.insert(rep);

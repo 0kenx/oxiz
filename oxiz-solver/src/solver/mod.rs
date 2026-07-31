@@ -41,7 +41,7 @@ use oxiz_core::sort::SortId;
 #[cfg(test)]
 use oxiz_sat::RestartStrategy;
 use oxiz_sat::{
-    Lit, Solver as SatSolver, SolverConfig as SatConfig, SolverResult as SatResult, Var,
+    Lit, Reason, Solver as SatSolver, SolverConfig as SatConfig, SolverResult as SatResult, Var,
 };
 use oxiz_theories::Theory;
 use oxiz_theories::arithmetic::ArithSolver;
@@ -594,6 +594,41 @@ impl Solver {
         result
     }
 
+    /// Negate every decision literal on the current trail into a blocking
+    /// clause, so the CDCL search never revisits this exact decision
+    /// assignment.  Returns `false` if there is nothing to block (level 0 or no
+    /// true decisions).  Used when an incomplete theory accepts a trail that
+    /// concrete evaluation refutes: rather than give up with `Unknown`, block
+    /// the spurious model and keep searching (bounded by `model_block_rounds`).
+    fn block_current_model(&mut self) -> bool {
+        let trail = self.sat.trail();
+        let level = trail.decision_level();
+        if level == 0 {
+            return false;
+        }
+        let mut clause: Vec<Lit> = Vec::with_capacity(level as usize);
+        for lev in 1..=level {
+            let Some(var) = trail.decision_var_at_level(lev) else {
+                continue;
+            };
+            // Reconstruct the decision literal from the assigned value.
+            let lit = if trail.value(var).is_true() {
+                Lit::pos(var)
+            } else {
+                Lit::neg(var)
+            };
+            // Only true decisions (not theory-as-decision mis-tags).
+            if matches!(trail.reason(var), Reason::Decision) {
+                clause.push(lit.negate());
+            }
+        }
+        if clause.is_empty() {
+            return false;
+        }
+        self.sat.add_clause(clause);
+        true
+    }
+
     /// Return the incremental theory solvers to their base scope, keeping every
     /// fact the next search round is entitled to and dropping every fact that
     /// belonged to a search *branch*.
@@ -976,6 +1011,8 @@ impl Solver {
         #[cfg(feature = "std")]
         let check_start = std::time::Instant::now();
 
+        let mut model_block_rounds: u32 = 0;
+
         loop {
             // Enforce the wall-clock timeout between MBQI rounds.  Mid-`solve`
             // enforcement lives in the theory callbacks (see TheoryManager).
@@ -1032,6 +1069,37 @@ impl Solver {
                         if self.model_refutes_assertions(manager) {
                             self.model = None;
                             self.unsat_core = None;
+                            // Incomplete theory can accept a trail that fails
+                            // concrete eval.  Block that decision assignment and
+                            // keep searching rather than giving up with Unknown
+                            // (critical for large discrete LIA after table fold).
+                            if model_block_rounds < 256 && self.block_current_model() {
+                                model_block_rounds += 1;
+                                self.sat.backtrack_to_root();
+                                self.euf.reset();
+                                self.arith.reset();
+                                self.bv.reset();
+                                theory_manager = TheoryManager::new(
+                                    manager,
+                                    &mut self.euf,
+                                    &mut self.arith,
+                                    &mut self.bv,
+                                    &self.bv_terms,
+                                    &self.var_to_constraint,
+                                    &self.var_to_parsed_arith,
+                                    &self.term_to_var,
+                                    &self.var_to_term,
+                                    &self.ite_result_terms,
+                                    &mut self.derived_reasons,
+                                    self.config.theory_mode,
+                                    &mut self.statistics,
+                                    self.config.max_conflicts,
+                                    self.config.max_decisions,
+                                    self.has_bv_arith_ops,
+                                    self.config.timeout_ms,
+                                );
+                                continue;
+                            }
                             return SolverResult::Unknown;
                         }
                         // Non-convex LIA refinement: an integer UF argument

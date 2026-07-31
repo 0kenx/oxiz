@@ -496,6 +496,10 @@ impl Solver {
     /// `Solver::invalidate_results` (private) for the rule and for why the unsat
     /// core goes with it.
     pub fn assert(&mut self, term: TermId, manager: &mut TermManager) {
+        // Replace inlined nullary define-fun bodies with their named consts
+        // (parser expands bindings at parse time).  Prevents re-flattening
+        // Discord/EM/R on every later assert that mentions them.
+        let term = self.fold_unit_eq_reps(term, manager);
         // Alias before rewrite: nullary define-fun `(= name body)` must link the
         // pre-inline `body` TermId (which later asserts re-use via parser
         // bindings) to `name` for domain splits.
