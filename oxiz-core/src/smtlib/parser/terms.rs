@@ -731,34 +731,31 @@ impl Parser<'_> {
     /// Expand an application of a `define-fun` definition by substituting the
     /// arguments for the parameters in the recorded body.
     fn expand_defined_fun(&mut self, name: &str, args: &[TermId]) -> Result<TermId> {
-        let Some((params, body)) = self.function_defs.get(name).cloned() else {
+        let Some(def) = self.function_defs.get(name).cloned() else {
             return Err(OxizError::ParseError {
                 position: self.lexer.position(),
                 message: format!("internal: no definition recorded for {name}"),
             });
         };
-        if args.len() != params.len() {
+        if args.len() != def.param_vars.len() {
             return Err(OxizError::ParseError {
                 position: 0,
                 message: format!(
                     "wrong number of arguments for {}: expected {}, got {}",
                     name,
-                    params.len(),
+                    def.param_vars.len(),
                     args.len()
                 ),
             });
         }
+        // Substitute call-site arguments for the exact parameter variables
+        // recorded in the body, avoiding any name/sort re-derivation that
+        // could mismatch the original binder.
         let mut substitution = FxHashMap::default();
-        for ((param_name, _param_sort), &arg) in params.iter().zip(args.iter()) {
-            let param_sort = self
-                .constants
-                .get(param_name)
-                .copied()
-                .unwrap_or(self.manager.sorts.bool_sort);
-            let param_var = self.manager.mk_var(param_name, param_sort);
+        for (&param_var, &arg) in def.param_vars.iter().zip(args.iter()) {
             substitution.insert(param_var, arg);
         }
-        Ok(self.manager.substitute(body, &substitution))
+        Ok(self.manager.substitute(def.body, &substitution))
     }
 
     /// Restore the scope a binder shadowed and build the quantifier.

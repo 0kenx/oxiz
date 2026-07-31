@@ -730,9 +730,14 @@ impl<'a> Parser<'a> {
 
                 // Create placeholder vars for parameters, reusing the
                 // already-resolved sort rather than re-parsing it from text.
+                // Keep the exact TermIds — call-site expansion substitutes by
+                // id, not by recreating vars from name/sort (a wrong sort would
+                // intern a different var and leave free parameters in the body).
+                let mut param_vars = Vec::with_capacity(params.len());
                 for ((pname, _psort), &sort_id) in params.iter().zip(param_sort_ids.iter()) {
                     let param_term = self.manager.mk_var(pname, sort_id);
                     self.bindings.insert(pname.clone(), param_term);
+                    param_vars.push(param_term);
                 }
 
                 // Parse body
@@ -748,8 +753,14 @@ impl<'a> Parser<'a> {
                 }
 
                 // Register function definition
-                self.function_defs
-                    .insert(name.clone(), (params.clone(), body));
+                self.function_defs.insert(
+                    name.clone(),
+                    super::DefinedFun {
+                        param_vars,
+                        params: params.clone(),
+                        body,
+                    },
+                );
 
                 // For nullary define-fun, inline it directly as a binding.
                 // Because that inlining is a *substitution* at every later

@@ -116,6 +116,18 @@ pub enum Command {
     Simplify(TermId),
 }
 
+/// A `define-fun` macro registered for call-site expansion.
+#[derive(Debug, Clone)]
+pub(super) struct DefinedFun {
+    /// Parameter variables exactly as bound while parsing the body.
+    pub(super) param_vars: Vec<TermId>,
+    /// `(name, sort-string)` pairs (for `Command::DefineFun` / introspection).
+    #[allow(dead_code)]
+    pub(super) params: Vec<(String, String)>,
+    /// Function body term (may mention `param_vars`).
+    pub(super) body: TermId,
+}
+
 /// Parser state
 pub struct Parser<'a> {
     pub(super) lexer: Lexer<'a>,
@@ -129,8 +141,13 @@ pub struct Parser<'a> {
     pub(super) functions: FxHashMap<String, (Vec<SortId>, SortId)>,
     /// Sort aliases from define-sort
     pub(super) sort_aliases: FxHashMap<String, (Vec<String>, String)>,
-    /// Function definitions from define-fun
-    pub(super) function_defs: FxHashMap<String, (Vec<(String, String)>, TermId)>,
+    /// Function definitions from define-fun.
+    ///
+    /// Stores the **exact** parameter `TermId`s used while parsing the body so
+    /// call-site expansion can substitute by id (name+sort recreation is not
+    /// enough: a wrong sort yields a different interned var and the body keeps
+    /// free parameters).
+    pub(super) function_defs: FxHashMap<String, DefinedFun>,
     /// Term annotations (term -> attributes)
     pub(super) annotations: FxHashMap<TermId, Vec<Attribute>>,
     /// Error recovery mode enabled

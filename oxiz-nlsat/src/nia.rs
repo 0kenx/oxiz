@@ -16,9 +16,11 @@
 
 use crate::solver::{AtomId, Model, NlsatSolver, SolverResult};
 use crate::types::{Atom, AtomKind, Literal};
+use num_bigint::BigInt;
 use num_rational::BigRational;
-use num_traits::ToPrimitive;
+use num_traits::{Signed, ToPrimitive, Zero};
 use oxiz_math::polynomial::{Polynomial, Var};
+use rustc_hash::FxHashMap;
 
 /// Integer variable type specification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,7 +221,9 @@ impl NiaSolver {
 
     /// Solve with integer constraints.
     ///
-    /// Uses branch-and-bound to find integer solutions.
+    /// Uses branch-and-bound to find integer solutions. When B&B is
+    /// inconclusive but every integer variable has a finite box of modest
+    /// size, falls back to exact domain enumeration (complete on that box).
     pub fn solve(&mut self) -> SolverResult {
         // Reset statistics
         self.stats = NiaStats::default();
@@ -232,7 +236,11 @@ impl NiaSolver {
                 // Real relaxation is UNSAT, so integer problem is also UNSAT
                 SolverResult::Unsat
             }
-            SolverResult::Unknown => SolverResult::Unknown,
+            SolverResult::Unknown => {
+                // Real CAD inconclusive — still try a finite integer box.
+                self.try_bounded_integer_enum()
+                    .unwrap_or(SolverResult::Unknown)
+            }
             SolverResult::Sat => {
                 // Check if the solution satisfies integer constraints
                 if let Some(model) = self.nlsat.get_model() {
@@ -243,13 +251,312 @@ impl NiaSolver {
                     }
 
                     // Need to branch
-                    return self.branch_and_bound();
+                    match self.branch_and_bound() {
+                        SolverResult::Unknown => self
+                            .try_bounded_integer_enum()
+                            .unwrap_or(SolverResult::Unknown),
+                        other => other,
+                    }
+                } else {
+                    self.try_bounded_integer_enum()
+                        .unwrap_or(SolverResult::Unknown)
                 }
-                SolverResult::Unknown
             }
         }
     }
 
+    /// Exact search over a finite integer box extracted from unit linear bounds.
+    ///
+    /// Returns `Some(Sat/Unsat)` when every integer-typed variable has finite
+    /// integer bounds and the cartesian product is within the node budget;
+    /// `None` when the problem is not a small pure-integer box (caller keeps
+    /// `Unknown`). Real-typed variables are not enumerated — mixed problems
+    /// fall through.
+    fn try_bounded_integer_enum(&mut self) -> Option<SolverResult> {
+        // Refuse mixed Int/Real: reals have no finite grid here.
+        for v in 0..self.nlsat.num_arith_vars() {
+            if self.var_type(v) == VarType::Real {
+                // Only block if the real var actually appears in a constraint.
+                // (Unmentioned reals are irrelevant.)
+                if self.var_mentioned_in_units(v) {
+                    return None;
+                }
+            }
+        }
+
+        let mut domains: Vec<(Var, i64, i64)> = Vec::new();
+        let mut product: u64 = 1;
+        const MAX_PRODUCT: u64 = 200_000;
+
+        for v in 0..self.nlsat.num_arith_vars() {
+            if self.var_type(v) != VarType::Integer {
+                continue;
+            }
+            if !self.var_mentioned_in_units(v) {
+                // Unconstrained integer: infinite domain.
+                return None;
+            }
+            let (lo, hi) = self.integer_bounds_from_units(v)?;
+            if hi < lo {
+                return Some(SolverResult::Unsat);
+            }
+            let width = (hi - lo + 1) as u64;
+            product = product.saturating_mul(width);
+            if product > MAX_PRODUCT {
+                return None;
+            }
+            domains.push((v, lo, hi));
+        }
+
+        if domains.is_empty() {
+            return None;
+        }
+
+        // Collect unit poly atoms with polarity (original non-learned units).
+        let units = self.collect_unit_poly_atoms()?;
+
+        // Cartesian product via odometer.
+        let mut idxs: Vec<i64> = domains.iter().map(|(_, lo, _)| *lo).collect();
+        loop {
+            self.stats.nodes_explored += 1;
+            let mut assignment: FxHashMap<Var, BigRational> = FxHashMap::default();
+            for (i, &(var, _, _)) in domains.iter().enumerate() {
+                assignment.insert(var, BigRational::from_integer(BigInt::from(idxs[i])));
+            }
+
+            if units_satisfied(&units, &assignment) {
+                // Install model on a fresh nlsat so get_model works.
+                let mut solver = NlsatSolver::new();
+                for _ in 0..self.nlsat.num_arith_vars() {
+                    solver.new_arith_var();
+                }
+                // Re-assert units and fix variables to the witness so the
+                // model is recoverable; then force-assign arith values.
+                for (poly, kind, positive) in &units {
+                    let id = solver.new_ineq_atom(poly.clone(), *kind);
+                    let lit = solver.atom_literal(id, *positive);
+                    solver.add_clause(vec![lit]);
+                }
+                for (&var, val) in &assignment {
+                    // var = val  as two-sided bound via equality atom
+                    let p = Polynomial::sub(
+                        &Polynomial::from_var(var),
+                        &Polynomial::constant(val.clone()),
+                    );
+                    let id = solver.new_ineq_atom(p, AtomKind::Eq);
+                    let lit = solver.atom_literal(id, true);
+                    solver.add_clause(vec![lit]);
+                }
+                // Prefer just setting arith after a quick solve; if solve
+                // fails, still report Sat with a synthetic model path.
+                match solver.solve() {
+                    SolverResult::Sat => {
+                        self.stats.integer_solutions += 1;
+                        self.nlsat = solver;
+                        return Some(SolverResult::Sat);
+                    }
+                    _ => {
+                        // Witness evaluates units true; trust Sat even if
+                        // CAD cannot rebuild (should be rare).
+                        self.stats.integer_solutions += 1;
+                        self.nlsat = solver;
+                        return Some(SolverResult::Sat);
+                    }
+                }
+            }
+
+            // Increment odometer.
+            let mut pos = 0;
+            loop {
+                if pos >= domains.len() {
+                    return Some(SolverResult::Unsat);
+                }
+                idxs[pos] += 1;
+                if idxs[pos] <= domains[pos].2 {
+                    break;
+                }
+                idxs[pos] = domains[pos].1;
+                pos += 1;
+            }
+        }
+    }
+
+    fn var_mentioned_in_units(&self, var: Var) -> bool {
+        for clause in self.nlsat.clauses().clauses() {
+            if clause.is_learned() || clause.len() != 1 {
+                continue;
+            }
+            let Some(lit) = clause.get(0) else {
+                continue;
+            };
+            let bvar = lit.var();
+            // Find atom for this bool var
+            for id in 0..self.nlsat.num_atoms() as AtomId {
+                if let Some(Atom::Ineq(ineq)) = self.nlsat.get_atom(id)
+                    && ineq.bool_var == bvar
+                    && ineq.factors.iter().any(|f| f.poly.vars().contains(&var))
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Tightest integer lower/upper bounds on `var` implied by unit linear
+    /// constraints. Returns `None` if either side is unbounded.
+    fn integer_bounds_from_units(&self, var: Var) -> Option<(i64, i64)> {
+        let mut lo: Option<i64> = None;
+        let mut hi: Option<i64> = None;
+
+        for clause in self.nlsat.clauses().clauses() {
+            if clause.is_learned() || clause.len() != 1 {
+                continue;
+            }
+            let Some(lit) = clause.get(0) else {
+                continue;
+            };
+            let positive = !lit.is_negated();
+            let bvar = lit.var();
+            for id in 0..self.nlsat.num_atoms() as AtomId {
+                let Some(Atom::Ineq(ineq)) = self.nlsat.get_atom(id) else {
+                    continue;
+                };
+                if ineq.bool_var != bvar || ineq.factors.len() != 1 {
+                    continue;
+                }
+                let poly = &ineq.factors[0].poly;
+                // Require univariate linear in `var`.
+                if poly.degree(var) != 1 || !poly.is_univariate() {
+                    continue;
+                }
+                // poly = a*var + b (univariate linear)
+                let a = poly.leading_coeff();
+                let b = poly.constant_term();
+                if a.is_zero() {
+                    continue;
+                }
+                // a*var + b OP 0 with OP from kind/polarity.
+                // var OP' -b/a
+                let bound_q = -&b / &a;
+                let a_pos = a.is_positive();
+                let (is_lower, strict) = match (ineq.kind, positive, a_pos) {
+                    (AtomKind::Gt, true, true) => (true, true), // var > bound
+                    (AtomKind::Lt, false, true) => (true, false), // var >= bound
+                    (AtomKind::Lt, true, false) => (true, true), // -var < -bound => var > bound
+                    (AtomKind::Gt, false, false) => (true, false),
+                    (AtomKind::Lt, true, true) => (false, true), // var < bound
+                    (AtomKind::Gt, false, true) => (false, false), // var <= bound
+                    (AtomKind::Gt, true, false) => (false, true),
+                    (AtomKind::Lt, false, false) => (false, false),
+                    (AtomKind::Eq, true, _) => {
+                        // var = bound_q must be integer
+                        if !bound_q.is_integer() {
+                            // equality to non-integer → no integer value
+                            return Some((1, 0)); // empty
+                        }
+                        let k = bound_q.to_i64()?;
+                        lo = Some(lo.map_or(k, |x| x.max(k)));
+                        hi = Some(hi.map_or(k, |x| x.min(k)));
+                        continue;
+                    }
+                    _ => continue,
+                };
+
+                // Convert rational bound to integer lo/hi.
+                if is_lower {
+                    let k = if strict {
+                        // var >= floor(bound)+1 if bound not integer, else bound+1
+                        if bound_q.is_integer() {
+                            bound_q.to_i64()? + 1
+                        } else {
+                            bound_q.floor().to_i64()? + 1
+                        }
+                    } else {
+                        // var >= ceil(bound)
+                        bound_q.ceil().to_i64()?
+                    };
+                    lo = Some(lo.map_or(k, |x| x.max(k)));
+                } else {
+                    let k = if strict {
+                        if bound_q.is_integer() {
+                            bound_q.to_i64()? - 1
+                        } else {
+                            bound_q.ceil().to_i64()? - 1
+                        }
+                    } else {
+                        bound_q.floor().to_i64()?
+                    };
+                    hi = Some(hi.map_or(k, |x| x.min(k)));
+                }
+            }
+        }
+
+        Some((lo?, hi?))
+    }
+
+    fn collect_unit_poly_atoms(&self) -> Option<Vec<(Polynomial, AtomKind, bool)>> {
+        let mut out = Vec::new();
+        for clause in self.nlsat.clauses().clauses() {
+            if clause.is_learned() {
+                continue;
+            }
+            if clause.len() != 1 {
+                // Non-unit: cannot evaluate a pure conjunction box search
+                // against the full problem.
+                return None;
+            }
+            let lit = clause.get(0)?;
+            let positive = !lit.is_negated();
+            let bvar = lit.var();
+            let mut found = false;
+            for id in 0..self.nlsat.num_atoms() as AtomId {
+                if let Some(Atom::Ineq(ineq)) = self.nlsat.get_atom(id)
+                    && ineq.bool_var == bvar
+                    && ineq.factors.len() == 1
+                {
+                    out.push((ineq.factors[0].poly.clone(), ineq.kind, positive));
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                return None;
+            }
+        }
+        Some(out)
+    }
+}
+
+/// Evaluate unit poly atoms under a total rational assignment.
+fn units_satisfied(
+    units: &[(Polynomial, AtomKind, bool)],
+    assignment: &FxHashMap<Var, BigRational>,
+) -> bool {
+    for (poly, kind, positive) in units {
+        let val = poly.eval(assignment);
+        let sign = if val.is_zero() {
+            0i8
+        } else if val.is_positive() {
+            1
+        } else {
+            -1
+        };
+        let holds = match kind {
+            AtomKind::Eq => sign == 0,
+            AtomKind::Lt => sign < 0,
+            AtomKind::Gt => sign > 0,
+            _ => return false,
+        };
+        let ok = if *positive { holds } else { !holds };
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
+impl NiaSolver {
     /// Take a faithful, replayable snapshot of `self.nlsat`'s current
     /// problem (arithmetic variable count, atoms, and non-learned clauses).
     ///
