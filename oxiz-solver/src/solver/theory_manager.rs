@@ -785,35 +785,34 @@ impl<'a> TheoryManager<'a> {
         for _ in 0..NO_MAX_ROUNDS {
             // ---- arithmetic → EUF: propagate entailed equalities. ----
             //
-            // Care graph: only a *live EUF disequality* can conflict with an
-            // arithmetic-entailed equality, so probe only those pairs — and
-            // only when arithmetic's current model already equates the two
-            // (the rest are consistent and need no probe).  This is
-            // O(#disequalities), not O(n²) over the interface, which is what
-            // keeps the combination affordable on large QF_UFLIA instances.
-            let mut merged_any = false;
-            for (x, y) in self.euf.live_diseq_pairs() {
-                // Only pairs the arithmetic model currently holds equal are
-                // candidates for an *entailed* equality.
-                let (Some(vx), Some(vy)) =
-                    (self.arith.value(x), self.arith.value(y))
-                else {
-                    continue;
-                };
-                if vx != vy {
-                    continue;
+            // Care graph (cvc5-style watched differences): difference-constraint
+            // pairs (x − y ≤ c) + live EUF disequality operands.  No model-equal
+            // filter — the probe is sound regardless and catches chain-derived
+            // equalities the model-equal filter misses.
+            let mut candidates: rustc_hash::FxHashSet<(TermId, TermId)> =
+                rustc_hash::FxHashSet::default();
+            for parsed in self.var_to_parsed_arith.values() {
+                if parsed.terms.len() == 2 {
+                    let (t0, c0) = (parsed.terms[0].0, parsed.terms[0].1);
+                    let (t1, c1) = (parsed.terms[1].0, parsed.terms[1].1);
+                    let is_diff = (c0 == Rational64::from_integer(1)
+                        && c1 == Rational64::from_integer(-1))
+                        || (c0 == Rational64::from_integer(-1)
+                            && c1 == Rational64::from_integer(1));
+                    if is_diff {
+                        candidates.insert(if t0 < t1 { (t0, t1) } else { (t1, t0) });
+                    }
                 }
+            }
+            for (a, b) in self.euf.live_diseq_pairs() {
+                candidates.insert(if a < b { (a, b) } else { (b, a) });
+            }
+            let mut merged_any = false;
+            for (x, y) in candidates {
                 let l_node = self.euf.intern(x);
                 let r_node = self.euf.intern(y);
-                if self.euf.are_equal(l_node, r_node) {
-                    continue;
-                }
-                // Soundness gate: only propagate an equality arithmetic
-                // *entails* (both strict directions infeasible), carrying its
-                // Farkas reason so a conflict citing the merge is explainable.
-                let Some(reason) = self.arith.entailed_equal_reason(x, y) else {
-                    continue;
-                };
+                if self.euf.are_equal(l_node, r_node) { continue; }
+                let Some(reason) = self.arith.entailed_equal_reason(x, y) else { continue; };
                 self.derived_reasons.record(x, reason);
                 let _ = self.euf.merge(l_node, r_node, x);
                 merged_any = true;
