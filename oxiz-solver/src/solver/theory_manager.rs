@@ -808,13 +808,35 @@ impl<'a> TheoryManager<'a> {
                 candidates.insert(if a < b { (a, b) } else { (b, a) });
             }
             let mut merged_any = false;
-            for (x, y) in candidates {
+            for &(x, y) in &candidates {
                 let l_node = self.euf.intern(x);
                 let r_node = self.euf.intern(y);
                 if self.euf.are_equal(l_node, r_node) { continue; }
                 let Some(reason) = self.arith.entailed_equal_reason(x, y) else { continue; };
                 self.derived_reasons.record(x, reason);
                 let _ = self.euf.merge(l_node, r_node, x);
+                merged_any = true;
+            }
+            // cvc5 watchedVariableCannotBeZero: propagate arith-entailed
+            // DISEQUALITIES.  For candidate pairs now EUF-merged (by the
+            // equality loop above or by congruence), if arith forces x≠y,
+            // assert the disequality in EUF → immediate conflict.
+            for &(x, y) in &candidates {
+                let lx = self.euf.intern(x);
+                let ly = self.euf.intern(y);
+                if !self.euf.are_equal(lx, ly) { continue; }
+                let Some(reason) = self.arith.entailed_disequal_reason(x, y) else { continue; };
+                self.derived_reasons.record(x, reason);
+                self.euf.assert_diseq(lx, ly, x);
+                if let Some(conflict_terms) = self.euf.check_conflicts() {
+                    self.statistics.theory_conflicts += 1;
+                    self.statistics.conflicts += 1;
+                    if self.max_conflicts > 0 && self.statistics.conflicts >= self.max_conflicts {
+                        self.resource_exhausted = true;
+                        return TheoryCheckResult::Sat;
+                    }
+                    return self.conflict_from_terms(&conflict_terms);
+                }
                 merged_any = true;
             }
             if merged_any {

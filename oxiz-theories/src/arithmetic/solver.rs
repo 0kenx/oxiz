@@ -1346,6 +1346,29 @@ impl ArithSolver {
         out
     }
 
+    /// Sound disequality-entailment probe.  Returns `Some(reason)` iff
+    /// arithmetic forces `x ≠ y` (i.e. `x = y` is infeasible).  cvc5's
+    /// `watchedVariableCannotBeZero` analogue.
+    pub fn entailed_disequal_reason(&mut self, x: TermId, y: TermId) -> Option<Vec<TermId>> {
+        let (Some(var_x), Some(var_y)) =
+            (self.term_to_var.get(&x).copied(), self.term_to_var.get(&y).copied())
+        else { return None; };
+        let base = self.reasons.len();
+        self.simplex.push();
+        let mut e1 = LinExpr::new();
+        e1.add_term(var_x, Rational64::one());
+        e1.add_term(var_y, -Rational64::one());
+        self.simplex.add_le(e1, 0);
+        let mut e2 = LinExpr::new();
+        e2.add_term(var_y, Rational64::one());
+        e2.add_term(var_x, -Rational64::one());
+        self.simplex.add_le(e2, 0);
+        let conflict = self.simplex.check().err();
+        self.simplex.pop();
+        let reasons = conflict?;
+        Some(self.reasons_from_ids(&reasons, base))
+    }
+
     pub fn entailed_equal_reason(
         &mut self,
         x: TermId,
