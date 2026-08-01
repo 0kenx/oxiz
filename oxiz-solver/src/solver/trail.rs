@@ -48,6 +48,8 @@ pub(crate) enum TrailOp {
     /// A z3-style triangle axiom `(t = c) ⟺ (t ≤ c ∧ t ≥ c)` was asserted for
     /// the `(term, const)` pair (see `axiomatize_arith_constant_equalities`).
     ArithConstAxiomAdded { term: TermId, const_val: i64 },
+    /// A care-graph equality atom was encoded as a CDCL decision variable.
+    CareSplitAdded { a: TermId, b: TermId },
     /// A ground datatype-axiom instance was asserted to the SAT core
     DtAxiomInstanceAdded { term: TermId },
     /// A Tseitin-memo entry was written by [`super::Solver::encode`].
@@ -169,6 +171,7 @@ impl super::Solver {
             array_axiom_instances: _, // TRAIL: ArrayAxiomInstanceAdded
             arith_defined_terms: _, // TRAIL: ArithDefinedTermAdded
             arith_const_axiom_pairs: _, // TRAIL: ArithConstAxiomAdded
+            care_split_pairs: _, // TRAIL: CareSplitAdded
             dt_axiom_instances: _, // TRAIL: DtAxiomInstanceAdded
             dt_axioms_incomplete: _, // SNAPSHOT
             entailed_int_consts: _, // cleared wholesale by `pop` (see the field doc); empty = re-fold, never stale

@@ -614,6 +614,23 @@ impl EufSolver {
             .collect()
     }
 
+    /// Every term that appears as the argument of a function application in
+    /// the e-graph — the structural EUF interface (congruence fires on these
+    /// terms' equality).
+    pub fn app_argument_terms(&self) -> rustc_hash::FxHashSet<TermId> {
+        let mut out: rustc_hash::FxHashSet<TermId> = rustc_hash::FxHashSet::default();
+        for n in &self.nodes {
+            if n.is_app() {
+                for &arg_node in &n.args {
+                    if let Some(t) = self.node_term(arg_node) {
+                        out.insert(t);
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Get the function symbol of a node (if it is a function application)
     pub fn node_func(&self, idx: u32) -> Option<u32> {
         self.nodes

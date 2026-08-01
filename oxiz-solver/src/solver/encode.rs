@@ -761,6 +761,49 @@ impl Solver {
         }
     }
 
+    /// Care-graph split: encode `(= a b)` as a CDCL decision atom for shared-term
+    /// pairs whose equality is still undecided.  cvc5-style `ensureLiteral` +
+    /// `preferPhase`.  No clause — `new_var` auto-inserts into decision heaps.
+    /// Over-approximates (only known-equal pairs dropped); difference-constraint
+    /// pairs + live-disequality operands form the candidate set.
+    pub(super) fn refine_care_graph_splits(&mut self, manager: &mut TermManager) -> bool {
+        if self.has_quantifiers { return false; }
+        use rustc_hash::FxHashSet;
+        const MAX_NEW_SPLITS: usize = 512;
+        let mut interface = self.euf.app_argument_terms();
+        for (a, b) in self.euf.live_diseq_pairs() { interface.insert(a); interface.insert(b); }
+        let shared: Vec<TermId> = self.arith.interface_terms().iter().copied()
+            .filter(|t| interface.contains(t)).collect();
+        if shared.len() < 2 { return false; }
+        let live_diseq: FxHashSet<(TermId, TermId)> = self.euf.live_diseq_pairs().into_iter()
+            .map(|(a, b)| if a < b { (a, b) } else { (b, a) }).collect();
+        let mut added = 0usize;
+        'outer: for i in 0..shared.len() {
+            let a = shared[i];
+            let sa = manager.get(a).map(|t| t.sort);
+            let na = match self.euf.term_to_node(a) { Some(n) => n, None => continue };
+            let ra = self.euf.find(na);
+            let va = self.arith.value(a);
+            for j in (i + 1)..shared.len() {
+                if added >= MAX_NEW_SPLITS { break 'outer; }
+                let b = shared[j];
+                if manager.get(b).map(|t| t.sort) != sa { continue; }
+                let nb = match self.euf.term_to_node(b) { Some(n) => n, None => continue };
+                if ra == self.euf.find(nb) { continue; }
+                let pair = if a < b { (a, b) } else { (b, a) };
+                if live_diseq.contains(&pair) { continue; }
+                if !self.care_split_pairs.insert(pair) { continue; }
+                let eq_term = manager.mk_eq(a, b);
+                let eq_lit = self.encode_depth(eq_term, manager, 0);
+                let model_eq = matches!((va, self.arith.value(b)), (Some(x), Some(y)) if x == y);
+                self.sat.set_preferred_phase(eq_lit.var(), model_eq);
+                self.trail.push(TrailOp::CareSplitAdded { a: pair.0, b: pair.1 });
+                added += 1;
+            }
+        }
+        added > 0
+    }
+
     /// Assert a named term (for unsat core tracking)
     ///
     /// Invalidates the last verdict for the same reason as [`Solver::assert`].

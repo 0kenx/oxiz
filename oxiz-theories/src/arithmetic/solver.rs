@@ -486,7 +486,12 @@ impl ArithSolver {
         })
     }
 
-    /// Soundly determine whether `term = const_value` is *entailed* by the
+    
+    /// Every term the arithmetic solver has internalised (interface / shared).
+    pub fn interface_terms(&self) -> &[TermId] {
+        &self.var_to_term
+    }
+/// Soundly determine whether `term = const_value` is *entailed* by the
     /// current arithmetic assignment, and if so return an all-atom reason
     /// (the SAT atoms whose assertion forces the equality).
     ///

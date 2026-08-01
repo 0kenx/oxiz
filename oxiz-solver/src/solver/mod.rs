@@ -152,6 +152,8 @@ pub struct Solver {
     /// z3-style triangle axiomatization can target exactly them, keeping the
     /// added boolean structure small.
     pub(super) ite_result_terms: FxHashSet<TermId>,
+    /// Care-graph split pairs for trailed dedup.
+    pub(super) care_split_pairs: FxHashSet<(TermId, TermId)>,
     /// Datatype constructor constraints: variable -> constructor name
     /// Used to detect mutual exclusivity conflicts (var = C1 AND var = C2 where C1 != C2)
     pub(super) dt_var_constructors: FxHashMap<TermId, oxiz_core::interner::Spur>,
@@ -405,6 +407,7 @@ impl Solver {
             has_bv_arith_ops: false,
             arith_terms: FxHashSet::default(),
             ite_result_terms: FxHashSet::default(),
+            care_split_pairs: FxHashSet::default(),
             dt_var_constructors: FxHashMap::default(),
             arith_parse_cache: FxHashMap::default(),
             tracked_compound_terms: FxHashSet::default(),
@@ -1013,6 +1016,34 @@ impl Solver {
                             // (only level-scoped pops), so we drop the trail to
                             // root and reset the three theory solvers.  The fresh
                             // `TheoryManager` then re-drives them from scratch.
+                            self.sat.backtrack_to_root();
+                            self.euf.reset();
+                            self.arith.reset();
+                            self.bv.reset();
+                            theory_manager = TheoryManager::new(
+                                manager,
+                                &mut self.euf,
+                                &mut self.arith,
+                                &mut self.bv,
+                                &self.bv_terms,
+                                &self.var_to_constraint,
+                                &self.var_to_parsed_arith,
+                                &self.term_to_var,
+                                &self.var_to_term,
+                                &self.ite_result_terms,
+                                &mut self.derived_reasons,
+                                self.config.theory_mode,
+                                &mut self.statistics,
+                                self.config.max_conflicts,
+                                self.config.max_decisions,
+                                self.has_bv_arith_ops,
+                                self.config.timeout_ms,
+                            );
+                            continue;
+                        }
+                        // Care-graph split: encode equality atoms for undecided
+                        // shared-term pairs so CDCL can branch on arrangements.
+                        if self.refine_care_graph_splits(manager) {
                             self.sat.backtrack_to_root();
                             self.euf.reset();
                             self.arith.reset();
@@ -1866,6 +1897,9 @@ impl Solver {
                             // dedup mark so a later `check` re-axiomatizes it.
                             self.arith_const_axiom_pairs.remove(&(term, const_val));
                         }
+                        TrailOp::CareSplitAdded { a, b } => {
+                            self.care_split_pairs.remove(&(a, b));
+                        }
                         TrailOp::EncodedTermAdded { term, previous } => {
                             // Take back exactly this one memo write.  `None`
                             // means the term's whole encoding was emitted inside
@@ -2026,6 +2060,7 @@ impl Solver {
         self.bv_terms.clear();
         self.arith_terms.clear();
         self.ite_result_terms.clear();
+        self.care_split_pairs.clear();
         self.dt_var_constructors.clear();
         self.arith_parse_cache.clear();
         self.tracked_compound_terms.clear();
