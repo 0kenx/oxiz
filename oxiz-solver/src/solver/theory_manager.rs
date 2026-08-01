@@ -815,12 +815,21 @@ impl<'a> TheoryManager<'a> {
             // the shared interface by arith value and add same-valued pairs
             // (capped) for the probe.  Sound: `entailed_equal_reason`
             // re-verifies entailment per pair.
-            const MAX_MODEL_EQ_PAIRS: usize = 1024;
+            const MAX_MODEL_EQ_PAIRS: usize = 256;
             let mut by_val: rustc_hash::FxHashMap<Rational64, Vec<TermId>> =
                 rustc_hash::FxHashMap::default();
+            // Only UF-ARGUMENT terms can enable a congruence `f(x)=f(y)` when
+            // merged, so restrict the model-equal probe set to them (the
+            // purification proxies are UF arguments; UF *results*, plain
+            // variables, and other arith terms are not, and probing their
+            // model-equal pairs is pure overhead that times out satisfiable
+            // instances).  This is the `shared` set used by the care graph.
+            let uf_args = self.euf.app_argument_terms();
             for &t in self.arith.interface_terms() {
-                if let Some(v) = self.arith.value(t) {
-                    by_val.entry(v).or_default().push(t);
+                if uf_args.contains(&t) {
+                    if let Some(v) = self.arith.value(t) {
+                        by_val.entry(v).or_default().push(t);
+                    }
                 }
             }
             let mut added_pairs = 0usize;

@@ -795,6 +795,18 @@ impl Solver {
         let shared: Vec<TermId> = self.arith.interface_terms().iter().copied()
             .filter(|t| interface.contains(t)).collect();
         if shared.len() < 2 { return; }
+        // cvc5's care graph is small (~10-50) thanks to tight purification.
+        // oxiz has none, so a large shared interface yields O(n^2) care atoms
+        // that bloat CDCL without helping (the equality arrangements that
+        // matter are far fewer than the pairs).  Skip when the interface is
+        // too large: the cost (timeouts on satisfiable hash/distinct instances
+        // with dozens of shared terms) outweighs the convexity-completeness
+        // benefit.  The remaining false-SAT is closed by UF-argument
+        // purification, not by this enumeration.
+        const MAX_CARE_INTERFACE: usize = 24;
+        if shared.len() > MAX_CARE_INTERFACE {
+            return;
+        }
         let mut added = 0usize;
         'outer: for i in 0..shared.len() {
             let a = shared[i];
