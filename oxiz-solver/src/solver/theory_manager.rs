@@ -712,6 +712,12 @@ impl<'a> TheoryManager<'a> {
     /// conflict is reported only when arithmetic really is refuted and comes
     /// with arithmetic's own core.
     fn model_based_combination(&mut self) -> TheoryCheckResult {
+        // Sound bound propagation: resolve forced comparison atoms before the
+        // model-based disagreement check.
+        if let Some(props) = self.derive_arith_propagations() {
+            self.statistics.theory_propagations += props.len() as u64;
+            return TheoryCheckResult::Propagated(props);
+        }
         // Map EUF representative node -> (witness term, its arith value) for the
         // first class member that carries a concrete arithmetic value.  Terms
         // without an arith value cannot participate in an arith disagreement and
@@ -879,6 +885,49 @@ impl<'a> TheoryManager<'a> {
         // disagreement check covers any residual EUF-class/arithmetic-value
         // disagreement the entailed-equality pass did not force.
         self.model_based_combination()
+    }
+
+    /// Sound forward theory propagation of comparison atoms (bound propagation).
+    ///
+    /// Scans every UNASSIGNED comparison atom and, for each whose truth is
+    /// forced by the current arithmetic bounds, emits a propagation with a
+    /// sound all-true-atom reason.  Resolves `ite` side-conditions
+    /// deductively from decided values instead of letting CDCL branch on them.
+    fn derive_arith_propagations(&mut self) -> Option<Vec<(Lit, SmallVec<[Lit; 8]>)>> {
+        const MAX_ATOMS: usize = 1024;
+        if self.var_to_constraint.len() > MAX_ATOMS { return None; }
+        let candidates: Vec<(Var, Vec<(TermId, Rational64)>, Rational64, bool, bool)> =
+            self.var_to_constraint.iter().filter_map(|(&var, _)| {
+                if self.assigned_pol_of(var).is_some() { return None; }
+                let parsed = self.var_to_parsed_arith.get(&var)?;
+                let (less, strict) = match parsed.constraint_type {
+                    ArithConstraintType::Lt => (true, true),
+                    ArithConstraintType::Le => (true, false),
+                    ArithConstraintType::Gt => (false, true),
+                    ArithConstraintType::Ge => (false, false),
+                };
+                Some((var, parsed.terms.to_vec(), parsed.constant, less, strict))
+            }).collect();
+        let mut props: Vec<(Lit, SmallVec<[Lit; 8]>)> = Vec::new();
+        for (var, terms, constant, less, strict) in candidates {
+            let Some((truth, reasons)) = self.arith.comparison_entailed_reason(
+                &terms, constant, less, strict,
+            ) else { continue; };
+            let mut reason_lits: SmallVec<[Lit; 8]> = SmallVec::new();
+            let mut ok = true;
+            for &r in &reasons {
+                match self.term_to_var.get(&r) {
+                    Some(&rv) if self.assigned_pol_of(rv) == Some(true) => {
+                        reason_lits.push(Lit::pos(rv));
+                    }
+                    _ => { ok = false; break; }
+                }
+            }
+            if ok {
+                props.push((if truth { Lit::pos(var) } else { Lit::neg(var) }, reason_lits));
+            }
+        }
+        if props.is_empty() { None } else { Some(props) }
     }
 
     /// Add an equality to be shared between theories

@@ -1274,6 +1274,73 @@ impl ArithSolver {
     ///
     /// Two `push`/probe/`pop` rounds so the solver's incremental state is
     /// untouched regardless of the outcome.
+    /// Sound comparison-entailment probe (bound propagation core).
+    ///
+    /// For a comparison atom `sum(coef_i·x_i) <op> constant`, returns
+    /// `Some((truth, reason))` iff arithmetic *forces* the atom to `truth`
+    /// (true or false) — implemented as two push/check/pop probes: assert the
+    /// atom (if infeasible, FALSE is forced) and assert its negation (if
+    /// infeasible, TRUE is forced).  `reason` is the Farkas certificate.
+    /// Sound by construction: the probes are on a scratch simplex scope.
+    ///
+    /// `less`: `sum ≤/< c` (Le/Lt) vs `sum ≥/> c` (Ge/Gt).
+    /// `strict`: strict inequality (Lt/Gt) vs non-strict (Le/Ge).
+    #[allow(clippy::too_many_arguments)]
+    pub fn comparison_entailed_reason(
+        &mut self,
+        terms: &[(TermId, Rational64)],
+        constant: Rational64,
+        less: bool,
+        strict: bool,
+    ) -> Option<(bool, Vec<TermId>)> {
+        let mut e = LinExpr::constant(-constant);
+        for &(term, coef) in terms {
+            let Some(&var) = self.term_to_var.get(&term) else { return None; };
+            e.add_term(var, coef);
+        }
+        let mut neg_e = LinExpr::constant(constant);
+        for &(term, coef) in terms {
+            if let Some(&var) = self.term_to_var.get(&term) {
+                neg_e.add_term(var, -coef);
+            }
+        }
+        let base = self.reasons.len();
+        let probe = |simplex: &mut Simplex, expr: LinExpr, is_strict: bool| -> Option<Vec<u32>> {
+            simplex.push();
+            if is_strict { simplex.add_strict_lt(expr, 0); } else { simplex.add_le(expr, 0); }
+            let r = simplex.check().err();
+            simplex.pop();
+            r
+        };
+        let (atom_expr, atom_strict, neg_expr, neg_strict) = match (less, strict) {
+            (true, false) => (e.clone(), false, neg_e.clone(), true),
+            (true, true) => (e.clone(), true, neg_e.clone(), false),
+            (false, false) => (neg_e.clone(), false, e.clone(), true),
+            (false, true) => (neg_e.clone(), true, e.clone(), false),
+        };
+        if let Some(reasons) = probe(&mut self.simplex, neg_expr, neg_strict) {
+            return Some((true, self.reasons_from_ids(&reasons, base)));
+        }
+        if let Some(reasons) = probe(&mut self.simplex, atom_expr, atom_strict) {
+            return Some((false, self.reasons_from_ids(&reasons, base)));
+        }
+        None
+    }
+
+    /// Collect reason terms from simplex Farkas IDs, truncate scratch buffer.
+    fn reasons_from_ids(&mut self, ids: &[u32], base: usize) -> Vec<TermId> {
+        let mut out: Vec<TermId> = Vec::new();
+        for &rid in ids {
+            if let Some(&t) = self.reasons.get(rid as usize) { out.push(t); }
+        }
+        self.reasons.truncate(base);
+        self.reason_counter = base as u32;
+        out.sort_unstable();
+        out.dedup();
+        if out.is_empty() { out = self.full_unsat_core(); }
+        out
+    }
+
     pub fn entailed_equal_reason(
         &mut self,
         x: TermId,
