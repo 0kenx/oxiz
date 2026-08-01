@@ -790,6 +790,9 @@ impl Solver {
                 if manager.get(b).map(|t| t.sort) != sa { continue; }
                 let nb = match self.euf.term_to_node(b) { Some(n) => n, None => continue };
                 if ra == self.euf.find(nb) { continue; }
+                // Cheap pre-filter: skip pairs already determined by point-bounds.
+                if !matches!(self.arith.equality_status(a, b),
+                    oxiz_theories::arithmetic::ArithEqualityStatus::Unknown) { continue; }
                 let pair = if a < b { (a, b) } else { (b, a) };
                 if live_diseq.contains(&pair) { continue; }
                 if !self.care_split_pairs.insert(pair) { continue; }

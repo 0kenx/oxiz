@@ -9,6 +9,29 @@ use num_traits::{One, Signed, Zero};
 use oxiz_core::ast::TermId;
 use oxiz_core::error::Result;
 
+/// Arithmetic equality solver's verdict on `a = b` from the current bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArithEqualityStatus {
+    /// Both sides are fixed to the same value ⇒ `a = b` entailed.
+    EntailedEqual,
+    /// Both sides are fixed to distinct values ⇒ `a ≠ b` entailed.
+    EntailedDisequal,
+    /// Arithmetic has not (yet) determined the equality.
+    Unknown,
+}
+
+/// If the lower and upper bounds coincide, the variable is *fixed* to that
+/// value; return it.
+fn fixed_value<'a>(
+    lo: Option<&'a super::simplex::Bound>,
+    hi: Option<&'a super::simplex::Bound>,
+) -> Option<&'a super::delta::DeltaRational> {
+    match (lo, hi) {
+        (Some(l), Some(u)) if l.value == u.value => Some(&l.value),
+        _ => None,
+    }
+}
+
 /// Compute GCD of two i64 values
 fn gcd_i64(mut a: i64, mut b: i64) -> i64 {
     a = a.abs();
@@ -487,7 +510,25 @@ impl ArithSolver {
     }
 
     
-    /// Every term the arithmetic solver has internalised (interface / shared).
+    
+    /// Status of the equality `a = b` from arithmetic's current bounds.
+    /// Covers the `equalsConstant` / point-bounded case.  Individually
+    /// classifies 0/14637 on pete2 (IDL terms are difference-linked, not
+    /// point-fixed), but may compound on the chain as a cheap pre-filter
+    /// for the care graph.
+    pub fn equality_status(&self, a: TermId, b: TermId) -> ArithEqualityStatus {
+        let (Some(va), Some(vb)) =
+            (self.term_to_var.get(&a).copied(), self.term_to_var.get(&b).copied())
+        else { return ArithEqualityStatus::Unknown; };
+        let fa = fixed_value(self.simplex.get_lower(va), self.simplex.get_upper(va));
+        let fb = fixed_value(self.simplex.get_lower(vb), self.simplex.get_upper(vb));
+        match (fa, fb) {
+            (Some(x), Some(y)) if x == y => ArithEqualityStatus::EntailedEqual,
+            (Some(_), Some(_)) => ArithEqualityStatus::EntailedDisequal,
+            _ => ArithEqualityStatus::Unknown,
+        }
+    }
+/// Every term the arithmetic solver has internalised (interface / shared).
     pub fn interface_terms(&self) -> &[TermId] {
         &self.var_to_term
     }
