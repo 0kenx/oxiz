@@ -897,6 +897,11 @@ impl Solver {
             None
         };
 
+        // Pre-encode care-graph equality atoms (cvc5-style `ensureLiteral`)
+        // so CDCL can branch on shared-term arrangements during the single
+        // search, before borrowing the theory solvers out to the TheoryManager.
+        self.pre_encode_care_graph_atoms(manager);
+
         // Run SAT solver with theory integration
         let mut theory_manager = TheoryManager::new(
             manager,
@@ -1048,34 +1053,10 @@ impl Solver {
                             );
                             continue;
                         }
-                        // Care-graph split: encode equality atoms for undecided
-                        // shared-term pairs so CDCL can branch on arrangements.
-                        if self.refine_care_graph_splits(manager) {
-                            self.sat.backtrack_to_root();
-                            self.euf.reset();
-                            self.arith.reset();
-                            self.bv.reset();
-                            theory_manager = TheoryManager::new(
-                                manager,
-                                &mut self.euf,
-                                &mut self.arith,
-                                &mut self.bv,
-                                &self.bv_terms,
-                                &self.var_to_constraint,
-                                &self.var_to_parsed_arith,
-                                &self.term_to_var,
-                                &self.var_to_term,
-                                &self.ite_result_terms,
-                                &mut self.derived_reasons,
-                                self.config.theory_mode,
-                                &mut self.statistics,
-                                self.config.max_conflicts,
-                                self.config.max_decisions,
-                                self.has_bv_arith_ops,
-                                self.config.timeout_ms,
-                            );
-                            continue;
-                        }
+                        // Care-graph equality atoms are now pre-encoded up front
+                        // (see `pre_encode_care_graph_atoms`) so CDCL branches on
+                        // the shared-term arrangement during the single search;
+                        // no post-Sat restart is needed here.
                         // Lazy array-axiom instantiation: the syntactic array
                         // pre-checks and EUF congruence do not implement a
                         // complete array decision procedure, so a candidate `Sat`

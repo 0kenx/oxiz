@@ -761,50 +761,60 @@ impl Solver {
         }
     }
 
-    /// Care-graph split: encode `(= a b)` as a CDCL decision atom for shared-term
-    /// pairs whose equality is still undecided.  cvc5-style `ensureLiteral` +
-    /// `preferPhase`.  No clause — `new_var` auto-inserts into decision heaps.
-    /// Over-approximates (only known-equal pairs dropped); difference-constraint
-    /// pairs + live-disequality operands form the candidate set.
-    pub(super) fn refine_care_graph_splits(&mut self, manager: &mut TermManager) -> bool {
-        if self.has_quantifiers { return false; }
-        use rustc_hash::FxHashSet;
-        const MAX_NEW_SPLITS: usize = 512;
-        let mut interface = self.euf.app_argument_terms();
-        for (a, b) in self.euf.live_diseq_pairs() { interface.insert(a); interface.insert(b); }
+    /// Static care-graph `ensureLiteral` (cvc5-style).  Before the search,
+    /// create CDCL decision atoms `(= a b)` for undecided shared-term pairs so
+    /// the solver can branch on the equality arrangement *during* the single
+    /// search, instead of via post-Sat refinement rounds that each backtrack
+    /// to root, reset every theory, rebuild the TheoryManager and re-solve.
+    ///
+    /// cvc5 adds the same literals incrementally via `ensureLiteral` inside
+    /// `combineTheories` (called from the theory's final-check, mid-search, no
+    /// restart).  oxiz's `TheoryCallback` cannot encode mid-search, so the
+    /// faithful analog is a single up-front pass: the literals exist from the
+    /// first decision, CDCL explores them with the rest of the formula, and no
+    /// re-solve is ever paid.  The previous post-Sat `refine_care_graph_splits`
+    /// restarted the whole solve per batch of atoms; on satisfiable instances
+    /// that multiplied into 3-4 full re-solves adding 500+ atoms each, turning
+    /// fast correct `sat` answers into timeouts for zero soundness gain (the
+    /// atoms never actually surfaced the hidden conflict -- CDCL still returned
+    /// `sat` even with every pair encoded).
+    pub(super) fn pre_encode_care_graph_atoms(&mut self, manager: &mut TermManager) {
+        if self.has_quantifiers { return; }
+        const MAX_CARE_ATOMS: usize = 1024;
+        // Shared interface = terms visible to BOTH EUF (as an application
+        // argument) and arithmetic.  cvc5 builds its care graph from the
+        // shared-terms set; oxiz has no purification so the interface is the
+        // arith-interned terms that also appear under a function symbol.
+        let interface = self.euf.app_argument_terms();
         let shared: Vec<TermId> = self.arith.interface_terms().iter().copied()
             .filter(|t| interface.contains(t)).collect();
-        if shared.len() < 2 { return false; }
-        let live_diseq: FxHashSet<(TermId, TermId)> = self.euf.live_diseq_pairs().into_iter()
-            .map(|(a, b)| if a < b { (a, b) } else { (b, a) }).collect();
+        if shared.len() < 2 { return; }
         let mut added = 0usize;
         'outer: for i in 0..shared.len() {
             let a = shared[i];
             let sa = manager.get(a).map(|t| t.sort);
             let na = match self.euf.term_to_node(a) { Some(n) => n, None => continue };
             let ra = self.euf.find(na);
-            let va = self.arith.value(a);
             for j in (i + 1)..shared.len() {
-                if added >= MAX_NEW_SPLITS { break 'outer; }
+                if added >= MAX_CARE_ATOMS { break 'outer; }
                 let b = shared[j];
                 if manager.get(b).map(|t| t.sort) != sa { continue; }
                 let nb = match self.euf.term_to_node(b) { Some(n) => n, None => continue };
-                if ra == self.euf.find(nb) { continue; }
-                // Cheap pre-filter: skip pairs already determined by point-bounds.
+                if ra == self.euf.find(nb) { continue; }          // already EUF-equal
+                // Cheap pre-filter: skip pairs already pinned by level-0 bounds.
                 if !matches!(self.arith.equality_status(a, b),
                     oxiz_theories::arithmetic::ArithEqualityStatus::Unknown) { continue; }
                 let pair = if a < b { (a, b) } else { (b, a) };
-                if live_diseq.contains(&pair) { continue; }
                 if !self.care_split_pairs.insert(pair) { continue; }
+                // ensureLiteral: create the equality atom so CDCL can decide it.
                 let eq_term = manager.mk_eq(a, b);
                 let eq_lit = self.encode_depth(eq_term, manager, 0);
-                let model_eq = matches!((va, self.arith.value(b)), (Some(x), Some(y)) if x == y);
-                self.sat.set_preferred_phase(eq_lit.var(), model_eq);
+                // cvc5 prefers the positive phase (try `a = b` first).
+                self.sat.set_preferred_phase(eq_lit.var(), true);
                 self.trail.push(TrailOp::CareSplitAdded { a: pair.0, b: pair.1 });
                 added += 1;
             }
         }
-        added > 0
     }
 
     /// Theory-aware decision hint: bump value atoms of `(or (= x v0) … (= x vn))`
