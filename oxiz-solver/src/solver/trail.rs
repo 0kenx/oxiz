@@ -45,6 +45,9 @@ pub(crate) enum TrailOp {
     ArrayAxiomInstanceAdded { term: TermId },
     /// A `div` / `mod` / numeric-`ite` term received its defining axioms
     ArithDefinedTermAdded { term: TermId },
+    /// A z3-style triangle axiom `(t = c) ⟺ (t ≤ c ∧ t ≥ c)` was asserted for
+    /// the `(term, const)` pair (see `axiomatize_arith_constant_equalities`).
+    ArithConstAxiomAdded { term: TermId, const_val: i64 },
     /// A ground datatype-axiom instance was asserted to the SAT core
     DtAxiomInstanceAdded { term: TermId },
     /// A Tseitin-memo entry was written by [`super::Solver::encode`].
@@ -152,6 +155,10 @@ impl super::Solver {
             bv_terms: _,                 // TRAIL: BvTermAdded
             has_bv_arith_ops: _,         // SNAPSHOT
             arith_terms: _,              // TRAIL: ArithTermAdded
+            ite_result_terms: _, // accumulates ite-result vars across `assert`s;
+            // a stale entry after `pop` only makes `axiomatize_arith_constant_
+            // equalities` re-emit a *valid* (redundant) triangle axiom, so it is
+            // sound to leave it (cleared wholesale only by `reset`).
             dt_var_constructors: _,      // TRAIL: DtVarConstructorAdded
             arith_parse_cache: _,        // INVARIANT: keyed by term structure
             tracked_compound_terms: _,   // TRAIL: TrackedCompoundAdded
@@ -161,6 +168,7 @@ impl super::Solver {
             has_array_ops: _, // SNAPSHOT
             array_axiom_instances: _, // TRAIL: ArrayAxiomInstanceAdded
             arith_defined_terms: _, // TRAIL: ArithDefinedTermAdded
+            arith_const_axiom_pairs: _, // TRAIL: ArithConstAxiomAdded
             dt_axiom_instances: _, // TRAIL: DtAxiomInstanceAdded
             dt_axioms_incomplete: _, // SNAPSHOT
             entailed_int_consts: _, // cleared wholesale by `pop` (see the field doc); empty = re-fold, never stale

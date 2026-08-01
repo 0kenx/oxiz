@@ -486,6 +486,93 @@ impl ArithSolver {
         })
     }
 
+    /// Soundly determine whether `term = const_value` is *entailed* by the
+    /// current arithmetic assignment, and if so return an all-atom reason
+    /// (the SAT atoms whose assertion forces the equality).
+    ///
+    /// Implemented as two infeasibility probes on a scratch simplex scope:
+    /// `term >= const_value` holds iff `term < const_value` is infeasible, and
+    /// `term <= const_value` holds iff `term > const_value` is infeasible.  The
+    /// reason is the union of the two Farkas certificates, with the probe's own
+    /// marker reason excluded.  When both hold with no collected reasons, the
+    /// equality is entailed by the empty set (level-0 facts) and the full
+    /// unsat-core is returned instead.
+    ///
+    /// Used by the z3-style `final_check` theory propagation to justify the
+    /// triangle `le`/`ge` atoms deterministically.
+    pub fn fixed_to_const_reason(&mut self, term: TermId, const_value: i64) -> Option<Vec<TermId>> {
+        let Some(&var) = self.term_to_var.get(&term) else {
+            return None;
+        };
+        let cv = Rational64::from_integer(const_value);
+        let base = self.reasons.len();
+        let mut collected: Vec<TermId> = Vec::new();
+        // term < const_value infeasible  ⟺  term >= const_value entailed.
+        let ge_entailed = {
+            self.simplex.push();
+            let marker = self.add_reason(term);
+            let mut e = LinExpr::new();
+            e.add_term(var, Rational64::one());
+            e.add_constant(-cv);
+            self.simplex.add_strict_lt(e, marker);
+            let r = match self.simplex.check() {
+                Ok(()) => false,
+                Err(reasons) => {
+                    for &rid in &reasons {
+                        if rid != marker {
+                            if let Some(&t) = self.reasons.get(rid as usize) {
+                                collected.push(t);
+                            }
+                        }
+                    }
+                    true
+                }
+            };
+            self.simplex.pop();
+            r
+        };
+        if !ge_entailed {
+            self.reasons.truncate(base);
+            self.reason_counter = base as u32;
+            return None;
+        }
+        // term > const_value infeasible  ⟺  term <= const_value entailed.
+        let le_entailed = {
+            self.simplex.push();
+            let marker = self.add_reason(term);
+            let mut e = LinExpr::new();
+            e.add_term(var, -Rational64::one());
+            e.add_constant(cv);
+            self.simplex.add_strict_lt(e, marker);
+            let r = match self.simplex.check() {
+                Ok(()) => false,
+                Err(reasons) => {
+                    for &rid in &reasons {
+                        if rid != marker {
+                            if let Some(&t) = self.reasons.get(rid as usize) {
+                                collected.push(t);
+                            }
+                        }
+                    }
+                    true
+                }
+            };
+            self.simplex.pop();
+            r
+        };
+        self.reasons.truncate(base);
+        self.reason_counter = base as u32;
+        if !le_entailed {
+            return None;
+        }
+        collected.sort_unstable();
+        collected.dedup();
+        if collected.is_empty() {
+            return Some(self.full_unsat_core());
+        }
+        Some(collected)
+    }
+
     /// Tighten a rational bound for integer variables
     ///
     /// For integer variables:

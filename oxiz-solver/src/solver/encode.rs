@@ -4,7 +4,7 @@
 use crate::prelude::*;
 use num_rational::Rational64;
 use num_traits::{One, ToPrimitive, Zero};
-use oxiz_core::ast::{TermId, TermKind, TermManager};
+use oxiz_core::ast::{collect_subterms, TermId, TermKind, TermManager};
 use oxiz_core::sort::SortId;
 use oxiz_sat::{Lit, Var};
 use smallvec::SmallVec;
@@ -627,6 +627,140 @@ impl Solver {
         self.record_assertion_identity(term, None, index);
     }
 
+    /// z3-style "triangle" axiomatization of arithmetic↔EUF equality sharing.
+    ///
+    /// For every interned integer arithmetic term `t` and every integer
+    /// constant `c` appearing in the formula, add the valid clauses
+    ///
+    /// ```text
+    ///   (t = c)  ⟺  (t ≤ c) ∧ (t ≥ c)
+    /// ```
+    /// i.e. `(~eq ∨ le)`, `(~eq ∨ ge)`, `(eq ∨ ~le ∨ ~ge)`.
+    ///
+    /// This complements *model-based* equality merging with *axiom-based*
+    /// combination: CDCL decides the equality atoms, the arithmetic solver
+    /// **validates** each decision via `check()` (a plain consistency test, no
+    /// reason extraction), and EUF merges with the equality atom — which carries
+    /// a SAT variable — as the reason.  Soundness is thus structural: only
+    /// logically-valid clauses are added, and every merge is justified by an
+    /// assigned atom.
+    ///
+    /// This is what makes the deeply-nested `ite`/`Sum` chains of
+    /// `EufLaArithmetic/hard` reduce: once CDCL sets `eq(ite_result, c)=true`
+    /// for the value `c` the arithmetic constraints actually force, arith
+    /// accepts it, EUF merges `ite_result` with `c`, and congruence closure
+    /// collapses the rest of the chain.
+    ///
+    /// RESTRICTION: only the fresh `ite`-result constants (`__oxiz_ite_*`)
+    /// introduced by `eliminate_nonbool_ite` are axiomatized.  Targeting exactly
+    /// them keeps the added boolean structure tiny so CDCL is not disrupted on
+    /// other benchmark families (e.g. WiSA), which would otherwise time out
+    /// from the clause blow-up of axiomatizing every arith term.
+    pub(super) fn axiomatize_arith_constant_equalities(
+        &mut self,
+        manager: &mut TermManager,
+    ) {
+        use rustc_hash::FxHashSet;
+
+        // The triangle axiomatization is a *quantifier-free* theory-combination
+        // technique: the non-convex LIA⇄EUF gaps it closes (EufLaArithmetic/hard)
+        // are all QF_*.  On a quantified goal the fresh eq/le/ge Boolean
+        // structure it introduces perturbs MBQI's model-based instantiation
+        // (shifting convergence and risking spurious / missed instantiations),
+        // so it is scoped out there — quantified combination falls back to the
+        // existing model-based path.  This also keeps the axiomatization
+        // idempotent across the repeated `check`s of an MBQI search.
+        if self.has_quantifiers {
+            return;
+        }
+
+        let int_sort = manager.sorts.int_sort;
+
+        // Integer-sorted `ite`-result constants to axiomatize against constants.
+        let terms: Vec<TermId> = self
+            .ite_result_terms
+            .iter()
+            .copied()
+            .filter(|&t| manager.get(t).is_some_and(|tm| tm.sort == int_sort))
+            .collect();
+        if terms.is_empty() {
+            return;
+        }
+
+        // Distinct integer constants appearing in the original assertions.
+        // Derived from `assertions` (fixed per scope) rather than
+        // `var_to_parsed_arith` (which grows as MBQI / theory-axiom
+        // instantiation add atoms across search rounds): a stable source keeps
+        // the axiomatization idempotent across repeated `check`s on the same
+        // goal.  Walking assertion subterms also reaches constants buried in
+        // quantifier bodies, so they are axiomatized from the first `check`.
+        let mut const_vals: FxHashSet<i64> = FxHashSet::default();
+        for &assertion in &self.assertions {
+            for st in collect_subterms(assertion, manager) {
+                if let Some(tm) = manager.get(st) {
+                    if let TermKind::IntConst(n) = &tm.kind {
+                        if let Some(v) = n.to_i64() {
+                            const_vals.insert(v);
+                        }
+                    }
+                }
+            }
+        }
+        if const_vals.is_empty() {
+            return;
+        }
+        let mut consts: Vec<i64> = const_vals.into_iter().collect();
+        consts.sort_unstable();
+
+        // Bound the work: skip axiomatization on very large interfaces to
+        // avoid clause blow-up (the model-based path still handles them).
+        const MAX_PAIRS: usize = 4096;
+        if terms.len().saturating_mul(consts.len()) > MAX_PAIRS {
+            return;
+        }
+
+        for &t in &terms {
+            for &c in &consts {
+                let pair = (t, c);
+                if !self.arith_const_axiom_pairs.insert(pair) {
+                    // Already axiomatized this (term, const) pair in a prior
+                    // `check` whose clauses survived (no retracting `pop`).
+                    continue;
+                }
+                let c_term = manager.mk_int(c);
+                if c_term == t {
+                    self.arith_const_axiom_pairs.remove(&pair);
+                    continue;
+                }
+                let eq_term = manager.mk_eq(t, c_term);
+                let le_term = manager.mk_le(t, c_term);
+                let ge_term = manager.mk_ge(t, c_term);
+                let eq_lit = self.encode_depth(eq_term, manager, 0);
+                let le_lit = self.encode_depth(le_term, manager, 0);
+                let ge_lit = self.encode_depth(ge_term, manager, 0);
+                // (t = c) -> (t <= c)
+                self.sat.add_clause([eq_lit.negate(), le_lit]);
+                // (t = c) -> (t >= c)
+                self.sat.add_clause([eq_lit.negate(), ge_lit]);
+                // (t <= c) ∧ (t >= c) -> (t = c)
+                self.sat
+                    .add_clause([eq_lit, le_lit.negate(), ge_lit.negate()]);
+                // Record the pair so a later `check` does not re-emit these
+                // clauses, and a retracting `pop` drops the mark so they are
+                // re-axiomatized when needed again.
+                self.trail
+                    .push(TrailOp::ArithConstAxiomAdded { term: t, const_val: c });
+                // No phase bias on `eq`: the z3-style theory propagation in
+                // `final_check` deterministically forces the correct `le`/`ge`
+                // (and thus `eq`) once arithmetic fixes the ite-result to a
+                // constant.  Biasing `eq` toward `true` would instead make CDCL
+                // wastefully try `eq=true` for the *wrong* constants first
+                // (arith conflict → backtrack) before the propagation fires.
+                let _ = eq_lit;
+            }
+        }
+    }
+
     /// Assert a named term (for unsat core tracking)
     ///
     /// Invalidates the last verdict for the same reason as [`Solver::assert`].
@@ -1036,6 +1170,7 @@ impl Solver {
             };
             if matches!(t.kind, TermKind::Ite(..)) && t.sort != bool_sort {
                 let v = manager.mk_var(&format!("__oxiz_ite_{}", st.0), t.sort);
+                self.ite_result_terms.insert(v);
                 map.insert(st, v);
             }
         }

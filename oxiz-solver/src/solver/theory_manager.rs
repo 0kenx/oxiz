@@ -85,6 +85,17 @@ pub(crate) struct TheoryManager<'a> {
     term_to_var: &'a FxHashMap<TermId, Var>,
     /// Reverse mapping from SAT variables to terms (for EUF merge reasons)
     var_to_term: &'a Vec<TermId>,
+    /// Fresh `ite`-result constants (`__oxiz_ite_*`) axiomatized against
+    /// constants (z3-style triangle).  Used by `final_check` to theory-propagate
+    /// the `le`/`ge` atoms deterministically when arithmetic fixes such a term
+    /// to a constant, so the equality is shared to EUF without CDCL search and
+    /// without fragile model-based merging.
+    ite_result_terms: &'a FxHashSet<TermId>,
+    /// `(ite-result term, constant value) → (le_var, ge_var)` for the z3-style
+    /// triangle axioms added at encode time.  Built once in [`new`] by scanning
+    /// `var_to_constraint`; used by `final_check` to theory-propagate the `le`/
+    /// `ge` atoms when arithmetic fixes an ite-result to a constant.
+    ite_const_axioms: FxHashMap<(TermId, i64), (Var, Var)>,
     /// Current decision level stack for backtracking
     level_stack: Vec<usize>,
     /// Number of processed assignments
@@ -245,6 +256,7 @@ impl<'a> TheoryManager<'a> {
         var_to_parsed_arith: &'a FxHashMap<Var, ParsedArithConstraint>,
         term_to_var: &'a FxHashMap<TermId, Var>,
         var_to_term: &'a Vec<TermId>,
+        ite_result_terms: &'a FxHashSet<TermId>,
         derived_reasons: &'a mut DerivedReasons,
         theory_mode: TheoryMode,
         statistics: &'a mut Statistics,
@@ -271,6 +283,7 @@ impl<'a> TheoryManager<'a> {
             var_to_parsed_arith,
             term_to_var,
             var_to_term,
+            ite_result_terms,
             derived_reasons,
             level_stack: vec![0],
             processed_count: 0,
@@ -284,6 +297,11 @@ impl<'a> TheoryManager<'a> {
             has_bv_arith_ops,
             interned_int_constants: FxHashMap::default(),
             interned_bv_constants: FxHashMap::default(),
+            ite_const_axioms: Self::build_ite_const_axioms(
+                var_to_constraint,
+                ite_result_terms,
+                manager,
+            ),
             bool_true_node: None,
             bool_false_node: None,
             resource_exhausted: false,
@@ -297,6 +315,59 @@ impl<'a> TheoryManager<'a> {
             assigned_level: FxHashMap::default(),
             tautological_reasons: FxHashSet::default(),
         }
+    }
+
+    /// Build the `(ite-result, const) → (le_var, ge_var)` map for the z3-style
+    /// triangle axioms by scanning the encoded comparison atoms.
+    ///
+    /// For every `le`/`ge` atom whose left operand is an axiomatized
+    /// `ite`-result term and whose right operand is an integer constant, record
+    /// the atom's SAT variable keyed by `(term, const_value)`.  `final_check`
+    /// then theory-propagates both variables when arithmetic fixes the term to
+    /// that constant, so the triangle clause `(eq ∨ ¬le ∨ ¬ge)` forces the
+    /// equality deterministically.
+    fn build_ite_const_axioms(
+        var_to_constraint: &FxHashMap<Var, Constraint>,
+        ite_result_terms: &FxHashSet<TermId>,
+        manager: &TermManager,
+    ) -> FxHashMap<(TermId, i64), (Var, Var)> {
+        let int_const_value = |t: TermId| -> Option<i64> {
+            manager.get(t).and_then(|tm| match &tm.kind {
+                TermKind::IntConst(n) => n.to_i64(),
+                _ => None,
+            })
+        };
+        let mut map: FxHashMap<(TermId, i64), (Option<Var>, Option<Var>)> =
+            FxHashMap::default();
+        for (&var, constraint) in var_to_constraint {
+            let (lhs, rhs, is_le) = match constraint {
+                Constraint::Le(l, r) => (*l, *r, true),
+                Constraint::Ge(l, r) => (*l, *r, false),
+                _ => continue,
+            };
+            if !ite_result_terms.contains(&lhs) {
+                continue;
+            }
+            let Some(c) = int_const_value(rhs) else {
+                continue;
+            };
+            let entry = map.entry((lhs, c)).or_insert((None, None));
+            if is_le {
+                entry.0 = Some(var);
+            } else {
+                entry.1 = Some(var);
+            }
+        }
+        map.into_iter()
+            .filter_map(|(k, (le, ge))| Some((k, (le?, ge?))))
+            .collect()
+    }
+
+    /// The polarity a theory variable is currently assigned, or `None` if it is
+    /// unassigned (not yet decided/propagated by the SAT core).
+    #[inline]
+    fn assigned_pol_of(&self, var: Var) -> Option<bool> {
+        self.assigned_polarity.get(&var).copied()
     }
 
     /// Returns `true` once the configured wall-clock deadline has passed.
@@ -1777,6 +1848,71 @@ impl TheoryCallback for TheoryManager<'_> {
             Ok(result) => {
                 match result {
                     oxiz_theories::TheoryCheckResult::Sat => {
+                        // z3-style theory propagation: for every axiomatized
+                        // `ite`-result term `t`, read its current arithmetic
+                        // value `v`; if arithmetic provably fixes `t = v` (with
+                        // an all-atom explanation), propagate the triangle's
+                        // `le`/`ge` atoms.  The clause `(eq ∨ ¬le ∨ ¬ge)` then
+                        // forces `eq`, EUF merges `t` with `v` using the `eq`
+                        // atom (SAT-backed reason), and congruence closure
+                        // collapses the nested chain — deterministically.
+                        // Cost: O(#ite-terms) — one value lookup + at most one
+                        // probe per term (only the constant it's assigned).
+                        let mut theory_props: Vec<(Lit, SmallVec<[Lit; 8]>)> = Vec::new();
+                        for &term in self.ite_result_terms {
+                            let Some(val) = self.arith.value(term) else {
+                                continue;
+                            };
+                            let Some(v) = (if val.is_integer() {
+                                val.to_i64()
+                            } else {
+                                None
+                            }) else {
+                                continue;
+                            };
+                            let Some(&(le_var, ge_var)) =
+                                self.ite_const_axioms.get(&(term, v))
+                            else {
+                                continue;
+                            };
+                            // Skip if both already assigned (avoids re-emitting
+                            // a no-op Propagated on a fully-assigned trail).
+                            if self.assigned_pol_of(le_var).is_some()
+                                && self.assigned_pol_of(ge_var).is_some()
+                            {
+                                continue;
+                            }
+                            let Some(reasons) = self.arith.fixed_to_const_reason(term, v)
+                            else {
+                                continue;
+                            };
+                            let mut reason_lits: SmallVec<[Lit; 8]> = SmallVec::new();
+                            let mut ok = true;
+                            for &r in &reasons {
+                                match self.term_to_var.get(&r) {
+                                    Some(&var) if self.assigned_pol_of(var) == Some(true) => {
+                                        reason_lits.push(Lit::pos(var));
+                                    }
+                                    _ => {
+                                        ok = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if !ok {
+                                continue;
+                            }
+                            if self.assigned_pol_of(le_var).is_none() {
+                                theory_props.push((Lit::pos(le_var), reason_lits.clone()));
+                            }
+                            if self.assigned_pol_of(ge_var).is_none() {
+                                theory_props.push((Lit::pos(ge_var), reason_lits));
+                            }
+                        }
+                        if !theory_props.is_empty() {
+                            self.statistics.theory_propagations += theory_props.len() as u64;
+                            return TheoryCheckResult::Propagated(theory_props);
+                        }
                         // Arithmetic is consistent, now check model-based theory combination
                         // This ensures that different theories agree on shared terms
                         self.model_based_combination()

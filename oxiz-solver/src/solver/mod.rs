@@ -144,6 +144,14 @@ pub struct Solver {
     pub(super) has_bv_arith_ops: bool,
     /// Arithmetic terms (Int/Real variables for model extraction)
     pub(super) arith_terms: FxHashSet<TermId>,
+    /// Fresh constants introduced by `eliminate_nonbool_ite` to stand for
+    /// non-Bool `ite` subterms (named `__oxiz_ite_*`).  These are the terms
+    /// whose value is fixed by an `ite` side-condition equality and that must
+    /// merge with their constant value in EUF for congruence closure to reduce
+    /// nested UF chains (the EufLaArithmetic/hard family).  Tracked so the
+    /// z3-style triangle axiomatization can target exactly them, keeping the
+    /// added boolean structure small.
+    pub(super) ite_result_terms: FxHashSet<TermId>,
     /// Datatype constructor constraints: variable -> constructor name
     /// Used to detect mutual exclusivity conflicts (var = C1 AND var = C2 where C1 != C2)
     pub(super) dt_var_constructors: FxHashMap<TermId, oxiz_core::interner::Spur>,
@@ -204,6 +212,11 @@ pub struct Solver {
     /// mentioning a term that is *not* in here has no theory semantics and
     /// `check` must answer `Unknown`.
     pub(super) arith_defined_terms: FxHashSet<TermId>,
+    /// z3-style triangle-axiom pairs `(ite-result term, const)` already
+    /// asserted (see [`Solver::axiomatize_arith_constant_equalities`]).
+    /// Trailed so the axiomatization is idempotent across repeated `check`s on
+    /// an unchanged goal yet re-runs for a pair whose clauses a `pop` retracted.
+    pub(super) arith_const_axiom_pairs: FxHashSet<(TermId, i64)>,
     /// Ground datatype-axiom instances (exhaustiveness, exclusivity,
     /// reconstruction, selector-over-constructor, congruence, acyclicity)
     /// already added to the SAT core as lemmas, keyed by the interned lemma
@@ -391,6 +404,7 @@ impl Solver {
             bv_terms: FxHashSet::default(),
             has_bv_arith_ops: false,
             arith_terms: FxHashSet::default(),
+            ite_result_terms: FxHashSet::default(),
             dt_var_constructors: FxHashMap::default(),
             arith_parse_cache: FxHashMap::default(),
             tracked_compound_terms: FxHashSet::default(),
@@ -400,6 +414,7 @@ impl Solver {
             has_array_ops: false,
             array_axiom_instances: FxHashSet::default(),
             arith_defined_terms: FxHashSet::default(),
+            arith_const_axiom_pairs: FxHashSet::default(),
             dt_axiom_instances: FxHashSet::default(),
             dt_axioms_incomplete: false,
             entailed_int_consts: FxHashMap::default(),
@@ -851,6 +866,15 @@ impl Solver {
         // `Solver::push` / `pop` and would leak across a user scope as well.
         self.rebase_theory_state();
 
+        // z3-style axiom-based arithmetic↔EUF equality sharing: add triangle
+        // axioms `(t = c) ⟺ (t ≤ c ∧ t ≥ c)` for the fresh `ite`-result terms
+        // vs the integer constants in the formula.  This lets CDCL + the arith
+        // consistency check drive theory combination soundly (atom-backed merge
+        // reasons), complementing the model-based merging in `final_check`.
+        // Must run after all assertions are encoded so the arith term set is
+        // complete.
+        self.axiomatize_arith_constant_equalities(manager);
+
         // Wall-clock deadline for the CDCL(T)/MBQI search.  `timeout_ms == 0`
         // means "no timeout".  The deadline is enforced (a) between MBQI
         // rounds here and (b) mid-search inside the theory callbacks, so a
@@ -874,6 +898,7 @@ impl Solver {
             &self.var_to_parsed_arith,
             &self.term_to_var,
             &self.var_to_term,
+            &self.ite_result_terms,
             &mut self.derived_reasons,
             self.config.theory_mode,
             &mut self.statistics,
@@ -1002,6 +1027,7 @@ impl Solver {
                                 &self.var_to_parsed_arith,
                                 &self.term_to_var,
                                 &self.var_to_term,
+                                &self.ite_result_terms,
                                 &mut self.derived_reasons,
                                 self.config.theory_mode,
                                 &mut self.statistics,
@@ -1056,6 +1082,7 @@ impl Solver {
                                 &self.var_to_parsed_arith,
                                 &self.term_to_var,
                                 &self.var_to_term,
+                                &self.ite_result_terms,
                                 &mut self.derived_reasons,
                                 self.config.theory_mode,
                                 &mut self.statistics,
@@ -1370,6 +1397,7 @@ impl Solver {
                         &self.var_to_parsed_arith,
                         &self.term_to_var,
                         &self.var_to_term,
+                        &self.ite_result_terms,
                         &mut self.derived_reasons,
                         self.config.theory_mode,
                         &mut self.statistics,
@@ -1832,6 +1860,12 @@ impl Solver {
                             // been dropped from the SAT core.
                             self.arith_defined_terms.remove(&term);
                         }
+                        TrailOp::ArithConstAxiomAdded { term, const_val } => {
+                            // The triangle clauses for this `(term, const)` pair
+                            // are retracted with the scope's clauses; drop the
+                            // dedup mark so a later `check` re-axiomatizes it.
+                            self.arith_const_axiom_pairs.remove(&(term, const_val));
+                        }
                         TrailOp::EncodedTermAdded { term, previous } => {
                             // Take back exactly this one memo write.  `None`
                             // means the term's whole encoding was emitted inside
@@ -1991,6 +2025,7 @@ impl Solver {
         self.polarities.clear();
         self.bv_terms.clear();
         self.arith_terms.clear();
+        self.ite_result_terms.clear();
         self.dt_var_constructors.clear();
         self.arith_parse_cache.clear();
         self.tracked_compound_terms.clear();
@@ -2000,6 +2035,7 @@ impl Solver {
         self.has_array_ops = false;
         self.array_axiom_instances.clear();
         self.arith_defined_terms.clear();
+        self.arith_const_axiom_pairs.clear();
         // The assertions that entailed these constants are gone; a survivor
         // would license a finite-range expansion the new formula never asserts.
         self.entailed_int_consts.clear();
