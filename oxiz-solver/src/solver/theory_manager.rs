@@ -749,6 +749,138 @@ impl<'a> TheoryManager<'a> {
         TheoryCheckResult::Sat
     }
 
+    /// Bidirectional Nelson–Oppen combination to a fixpoint.
+    ///
+    /// tip's [`Self::model_based_combination`] is one direction of the equality
+    /// exchange — it propagates EUF-derived equalities *into* arithmetic (two
+    /// shared terms in one EUF class with different arithmetic values must be
+    /// equal, so assert the equality and let the tableau refute it).  The other
+    /// direction — arithmetic-**entailed** equalities propagated *into* EUF —
+    /// was missing, and its absence is the source of the non-convex
+    /// QF_UFLIA/QF_UFIDL false-SAT: arithmetic can force `x = y` (e.g. two
+    /// `ite`-result terms both pinned to `2·t`) while EUF holds them distinct
+    /// under a `distinct`/disequality, and without propagating that entailed
+    /// equality the `distinct` conflict is never seen.
+    ///
+    /// This closes the loop: alternate the two directions until neither produces
+    /// new information (bounded, since each round strictly grows the EUF merge
+    /// set or the asserted-equality set), then fall back to the model-based
+    /// disagreement check.  Arithmetic-entailed equalities come with their
+    /// Farkas reason ([`ArithSolver::entailed_equal_reason`]) and are
+    /// recorded under their tag in [`derived_reasons`], so a conflict that cites
+    /// the resulting EUF merge expands back to the arithmetic atoms that forced
+    /// it — the merge is a *deduction*, never a guess, so it cannot cause a
+    /// false `unsat`.
+    fn nelson_oppen_combine(&mut self) -> TheoryCheckResult {
+        use oxiz_theories::Theory;
+        use oxiz_theories::TheoryCheckResult as TheoryCheckResultEnum;
+
+        const NO_MAX_ROUNDS: usize = 8;
+        for _ in 0..NO_MAX_ROUNDS {
+            // ---- arithmetic → EUF: propagate entailed equalities. ----
+            //
+            // Care graph: only a *live EUF disequality* can conflict with an
+            // arithmetic-entailed equality, so probe only those pairs — and
+            // only when arithmetic's current model already equates the two
+            // (the rest are consistent and need no probe).  This is
+            // O(#disequalities), not O(n²) over the interface, which is what
+            // keeps the combination affordable on large QF_UFLIA instances.
+            let mut merged_any = false;
+            for (x, y) in self.euf.live_diseq_pairs() {
+                // Only pairs the arithmetic model currently holds equal are
+                // candidates for an *entailed* equality.
+                let (Some(vx), Some(vy)) =
+                    (self.arith.value(x), self.arith.value(y))
+                else {
+                    continue;
+                };
+                if vx != vy {
+                    continue;
+                }
+                let l_node = self.euf.intern(x);
+                let r_node = self.euf.intern(y);
+                if self.euf.are_equal(l_node, r_node) {
+                    continue;
+                }
+                // Soundness gate: only propagate an equality arithmetic
+                // *entails* (both strict directions infeasible), carrying its
+                // Farkas reason so a conflict citing the merge is explainable.
+                let Some(reason) = self.arith.entailed_equal_reason(x, y) else {
+                    continue;
+                };
+                self.derived_reasons.record(x, reason);
+                let _ = self.euf.merge(l_node, r_node, x);
+                merged_any = true;
+            }
+            if merged_any {
+                if let Some(conflict_terms) = self.euf.check_conflicts() {
+                    self.statistics.theory_conflicts += 1;
+                    self.statistics.conflicts += 1;
+                    if self.max_conflicts > 0
+                        && self.statistics.conflicts >= self.max_conflicts
+                    {
+                        self.resource_exhausted = true;
+                        return TheoryCheckResult::Sat;
+                    }
+                    return self.conflict_from_terms(&conflict_terms);
+                }
+            }
+            if !merged_any {
+                break;
+            }
+
+            // ---- EUF → arithmetic: the new merges may put two terms in one
+            //       class with different arithmetic values; assert the equality
+            //       and let the tableau refute it. ----
+            let mut dedup: FxHashSet<(TermId, TermId)> = FxHashSet::default();
+            let eu = self.propagate_euf_equalities_to_arith(&mut dedup);
+            if let TheoryCheckResult::Conflict(_) = eu {
+                self.statistics.theory_conflicts += 1;
+                self.statistics.conflicts += 1;
+                if self.max_conflicts > 0
+                    && self.statistics.conflicts >= self.max_conflicts
+                {
+                    self.resource_exhausted = true;
+                    return TheoryCheckResult::Sat;
+                }
+                return eu;
+            }
+            // `eu == Sat` here; any other variant would be terminal and is
+            // covered by returning it directly.
+            if !matches!(eu, TheoryCheckResult::Sat) {
+                return eu;
+            }
+            match self.arith.check() {
+                Ok(TheoryCheckResultEnum::Sat) => {
+                    // continue to the next arith→EUF round
+                }
+                Ok(TheoryCheckResultEnum::Unsat(conflict_terms)) => {
+                    self.statistics.theory_conflicts += 1;
+                    self.statistics.conflicts += 1;
+                    if self.max_conflicts > 0
+                        && self.statistics.conflicts >= self.max_conflicts
+                    {
+                        self.resource_exhausted = true;
+                        return TheoryCheckResult::Sat;
+                    }
+                    return self.conflict_from_terms(&conflict_terms);
+                }
+                Ok(_) => {
+                    self.resource_exhausted = true;
+                    return TheoryCheckResult::Sat;
+                }
+                Err(_) => {
+                    self.resource_exhausted = true;
+                    return TheoryCheckResult::Sat;
+                }
+            }
+        }
+        // Fixpoint reached (or round bound hit): final model-based
+        // disagreement check covers any residual EUF-class/arithmetic-value
+        // disagreement the entailed-equality pass did not force.
+        self.model_based_combination()
+    }
+
     /// Add an equality to be shared between theories
     #[allow(dead_code)]
     fn add_shared_equality(&mut self, lhs: TermId, rhs: TermId, reason: Option<TermId>) {
@@ -1915,7 +2047,7 @@ impl TheoryCallback for TheoryManager<'_> {
                         }
                         // Arithmetic is consistent, now check model-based theory combination
                         // This ensures that different theories agree on shared terms
-                        self.model_based_combination()
+                        self.nelson_oppen_combine()
                     }
                     oxiz_theories::TheoryCheckResult::Unsat(conflict_terms) => {
                         // Arithmetic conflict detected - convert to SAT conflict clause

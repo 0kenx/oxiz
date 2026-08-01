@@ -1222,6 +1222,111 @@ impl ArithSolver {
 
         result
     }
+
+    /// Group the interface (arith-interned) terms by their current simplex
+    /// model value, returning every group of size >= 2 (terms the arithmetic
+    /// model currently holds *equal*).  Cheap -- no feasibility probe, just a
+    /// value read and a sort.  These groups are the candidate set for
+    /// [`Self::entailed_equal_reason`]; the caller (which knows the EUF class
+    /// structure) filters out pairs already equal in EUF before paying for a
+    /// probe, which is what keeps theory combination affordable on large
+    /// interfaces.
+    pub fn interface_value_buckets(&self) -> Vec<Vec<TermId>> {
+        if self.var_to_term.len() < 2 {
+            return Vec::new();
+        }
+        let mut candidates: Vec<(super::delta::DeltaRational, TermId)> = self
+            .var_to_term
+            .iter()
+            .filter_map(|&term| {
+                let var = self.term_to_var.get(&term).copied()?;
+                Some((self.simplex.delta_value(var), term))
+            })
+            .collect();
+        if candidates.len() < 2 {
+            return Vec::new();
+        }
+        candidates.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut buckets: Vec<Vec<TermId>> = Vec::new();
+        let mut i = 0;
+        while i < candidates.len() {
+            let start = i;
+            while i < candidates.len() && candidates[i].0 == candidates[start].0 {
+                i += 1;
+            }
+            if i - start >= 2 {
+                buckets.push(candidates[start..i].iter().map(|(_, t)| *t).collect());
+            }
+        }
+        buckets
+    }
+
+    /// Sound single-pair equality-entailment probe with Farkas reason.
+    ///
+    /// Returns `Some(reason)` iff arithmetic *entails* `x = y` -- both `x < y`
+    /// and `x > y` are infeasible in the current simplex state -- where `reason`
+    /// is the set of already-asserted comparison atoms whose conjunction forces
+    /// the equality (the union of the two infeasibility certificates).  The
+    /// equality is therefore a *deduction*: propagating it to another theory
+    /// (merging in EUF) is sound as long as `reason` is carried into any
+    /// conflict explanation.  `None` means arithmetic does not entail the
+    /// equality (the model merely happened to assign the same value).
+    ///
+    /// Two `push`/probe/`pop` rounds so the solver's incremental state is
+    /// untouched regardless of the outcome.
+    pub fn entailed_equal_reason(
+        &mut self,
+        x: TermId,
+        y: TermId,
+    ) -> Option<Vec<TermId>> {
+        let (Some(var_x), Some(var_y)) =
+            (self.term_to_var.get(&x).copied(), self.term_to_var.get(&y).copied())
+        else {
+            return None;
+        };
+        let base = self.reasons.len();
+        // x < y infeasible  <=>  x >= y entailed.
+        let ge_reasons = {
+            self.simplex.push();
+            let mut e = LinExpr::new();
+            e.add_term(var_x, Rational64::one());
+            e.add_term(var_y, -Rational64::one());
+            self.simplex.add_strict_lt(e, 0);
+            let r = self.simplex.check().err();
+            self.simplex.pop();
+            r
+        };
+        let ge_reasons = ge_reasons?;
+        // x > y infeasible  <=>  x <= y entailed.
+        let le_reasons = {
+            self.simplex.push();
+            let mut e = LinExpr::new();
+            e.add_term(var_y, Rational64::one());
+            e.add_term(var_x, -Rational64::one());
+            self.simplex.add_strict_lt(e, 0);
+            let r = self.simplex.check().err();
+            self.simplex.pop();
+            r
+        };
+        let le_reasons = le_reasons?;
+        let mut reason_terms: Vec<TermId> = Vec::new();
+        for &rid in ge_reasons.iter().chain(le_reasons.iter()) {
+            if let Some(&t) = self.reasons.get(rid as usize) {
+                reason_terms.push(t);
+            }
+        }
+        self.reasons.truncate(base);
+        self.reason_counter = base as u32;
+        reason_terms.sort_unstable();
+        reason_terms.dedup();
+        if reason_terms.is_empty() {
+            // Entailed at decision level 0 (no atom reason): justify with the
+            // full unsat-core so a conflict citing this merge is explainable.
+            reason_terms = self.full_unsat_core();
+        }
+        Some(reason_terms)
+    }
+
 }
 
 #[cfg(test)]

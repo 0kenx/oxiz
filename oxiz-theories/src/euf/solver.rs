@@ -597,6 +597,23 @@ impl EufSolver {
         self.nodes.get(idx as usize).map(|n| n.term)
     }
 
+    /// Every **live** (in-scope) disequality as a pair of terms.
+    ///
+    /// `diseqs` is scope-truncated on `pop`, so this is exactly the set of
+    /// `a ≠ b` facts currently asserted.  Used by theory combination as a
+    /// *care graph*: the only shared-term pairs whose equality could possibly
+    /// conflict with EUF are these, so an arithmetic entailment probe need only
+    /// run on them (and only when arithmetic's model already equates the two) —
+    /// O(#disequalities) instead of O(n²) over the whole interface.
+    pub fn live_diseq_pairs(&self) -> Vec<(TermId, TermId)> {
+        self.diseqs
+            .iter()
+            .filter_map(|d| {
+                Some((self.node_term(d.lhs)?, self.node_term(d.rhs)?))
+            })
+            .collect()
+    }
+
     /// Get the function symbol of a node (if it is a function application)
     pub fn node_func(&self, idx: u32) -> Option<u32> {
         self.nodes
