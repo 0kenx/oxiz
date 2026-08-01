@@ -860,6 +860,50 @@ impl Solver {
     /// Assert a named term (for unsat core tracking)
     ///
     /// Invalidates the last verdict for the same reason as [`Solver::assert`].
+    /// Ensure arith trichotomy clauses for ALL numeric equalities/disequalities,
+    /// including those nested inside `let` bindings or array `select` results
+    /// that `add_arith_diseq_split`'s walk misses (swap/storecomm: `let`-bound
+    /// `(not (= (select…) (select…)))` → `term_to_var=1`, opaque Boolean).
+    ///
+    /// Scans every assertion's subterms (collect_subterms handles `let`) for
+    /// `Not(Eq(a,b))` and `Eq(a,b)` where both sides are Int/Real-sorted, and
+    /// calls `add_arith_trichotomy_clause` for each.  This makes the arith
+    /// solver SEE the equality, enabling the combination to reason about array
+    /// select results.
+    pub(super) fn ensure_numeric_equality_splits(&mut self, manager: &mut TermManager) {
+        use rustc_hash::FxHashSet;
+        let int_sort = manager.sorts.int_sort;
+        let real_sort = manager.sorts.real_sort;
+        let mut seen: FxHashSet<(TermId, TermId)> = FxHashSet::default();
+        // Collect pairs first (avoids holding &self.assertions across &mut self).
+        let assertions: Vec<TermId> = self.assertions.clone();
+        let mut pairs: Vec<(TermId, TermId)> = Vec::new();
+        for &assertion in &assertions {
+            for st in collect_subterms(assertion, manager) {
+                let Some(t) = manager.get(st) else { continue };
+                let (a, b) = match &t.kind {
+                    TermKind::Not(inner) => {
+                        let Some(it) = manager.get(*inner) else { continue };
+                        match &it.kind {
+                            TermKind::Eq(a, b) => (*a, *b),
+                            _ => continue,
+                        }
+                    }
+                    TermKind::Eq(a, b) => (*a, *b),
+                    _ => continue,
+                };
+                let na = manager.get(a).is_some_and(|t| t.sort == int_sort || t.sort == real_sort);
+                let nb = manager.get(b).is_some_and(|t| t.sort == int_sort || t.sort == real_sort);
+                if !na || !nb { continue; }
+                let pair = if a < b { (a, b) } else { (b, a) };
+                if seen.insert(pair) { pairs.push((a, b)); }
+            }
+        }
+        for (a, b) in pairs {
+            self.add_arith_trichotomy_clause(a, b, manager);
+        }
+    }
+
     pub fn assert_named(&mut self, term: TermId, name: &str, manager: &mut TermManager) {
         let index = self.assertions.len();
         self.assertions.push(term);
