@@ -878,6 +878,9 @@ impl Solver {
         // complete.
         self.axiomatize_arith_constant_equalities(manager);
 
+        // Theory-aware decision hint: prioritize finite-domain value atoms.
+        self.bump_finite_domain_enumerations(manager);
+
         // Wall-clock deadline for the CDCL(T)/MBQI search.  `timeout_ms == 0`
         // means "no timeout".  The deadline is enforced (a) between MBQI
         // rounds here and (b) mid-search inside the theory callbacks, so a

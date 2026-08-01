@@ -1237,6 +1237,18 @@ impl Solver {
     /// `true` (`try_true_first`) makes CDCL prefer merging shared terms, so the
     /// arithmetic solver's consistency check (`check`) — not fragile reason
     /// extraction — drives theory combination.
+    /// Theory-aware decision hint: bump the activity of these variables so
+    /// the branching heuristic prefers deciding them early.  Mirrors the
+    /// per-conflict bump in conflict.rs so it works under every strategy.
+    pub fn bump_decision_hint(&mut self, vars: &[Var]) {
+        if vars.is_empty() { return; }
+        self.vsids.bump_batch(vars);
+        if self.config.use_chb_branching { self.chb.bump_batch(vars); }
+        if self.config.use_vmtf {
+            for &v in vars { self.vmtf.bump(v, |v| self.trail.is_assigned(v)); }
+        }
+    }
+
     pub fn set_preferred_phase(&mut self, var: Var, phase: bool) {
         let idx = var.index();
         if idx < self.phase.len() {

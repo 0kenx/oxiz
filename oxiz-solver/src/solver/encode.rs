@@ -804,6 +804,56 @@ impl Solver {
         added > 0
     }
 
+    /// Theory-aware decision hint: bump value atoms of `(or (= x v0) … (= x vn))`
+    /// enumerations so CDCL decides them early (and prefers positive phase).
+    pub(super) fn bump_finite_domain_enumerations(&mut self, manager: &TermManager) {
+        use rustc_hash::FxHashSet;
+        let mut atoms: Vec<oxiz_sat::Var> = Vec::new();
+        let mut seen_or: FxHashSet<TermId> = FxHashSet::default();
+        for &assertion in &self.assertions {
+            for st in collect_subterms(assertion, manager) {
+                let Some(t) = manager.get(st) else { continue };
+                if !matches!(t.kind, TermKind::Or(_)) { continue; }
+                if !seen_or.insert(st) { continue; }
+                let mut leaves: Vec<TermId> = Vec::new();
+                let mut stack: Vec<TermId> = vec![st];
+                let mut the_var: Option<TermId> = None;
+                let mut ok = true;
+                while let Some(n) = stack.pop() {
+                    let Some(nt) = manager.get(n) else { ok = false; break };
+                    match &nt.kind {
+                        TermKind::Or(args) => {
+                            if leaves.len() + stack.len() + args.len() > 256 { ok = false; break; }
+                            for &a in args { stack.push(a); }
+                        }
+                        TermKind::Eq(l, r) => {
+                            let v = match (manager.get(*l), manager.get(*r)) {
+                                (Some(lt), _) if matches!(lt.kind, TermKind::Var(_)) => *l,
+                                (_, Some(rt)) if matches!(rt.kind, TermKind::Var(_)) => *r,
+                                _ => { ok = false; break }
+                            };
+                            match the_var {
+                                None => the_var = Some(v),
+                                Some(p) if p == v => {}
+                                _ => { ok = false; break }
+                            }
+                            leaves.push(n);
+                        }
+                        _ => { ok = false; break }
+                    }
+                }
+                if !ok || !(2..=64).contains(&leaves.len()) { continue; }
+                for &eq_term in &leaves {
+                    if let Some(&v) = self.term_to_var.get(&eq_term) {
+                        atoms.push(v);
+                        self.sat.set_preferred_phase(v, true);
+                    }
+                }
+            }
+        }
+        if !atoms.is_empty() { self.sat.bump_decision_hint(&atoms); }
+    }
+
     /// Assert a named term (for unsat core tracking)
     ///
     /// Invalidates the last verdict for the same reason as [`Solver::assert`].
