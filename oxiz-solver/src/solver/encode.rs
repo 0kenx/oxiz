@@ -504,6 +504,12 @@ impl Solver {
         // vars + defining equalities, so Bool completion can merge equal-valued
         // arguments and congruence over the application can fire.
         let term = self.abstract_compound_bool_args(term, manager);
+        // Purify numeric (Int/Real) UF-application arguments into fresh shared
+        // variables.  `track_theory_vars` does not intern UF arguments, so a
+        // constant/compound argument like `f(3)` or `f(fmt1 + 1)` is never an
+        // arithmetic interface term and arithmetic-derived equalities to it
+        // never reach EUF (the QF_UFLIA/QF_UFIDL false-SAT root cause).
+        let term = self.purify_numeric_uf_args(term, manager);
 
         let index = self.assertions.len();
         self.assertions.push(term);
@@ -1403,6 +1409,113 @@ impl Solver {
                 continue;
             }
             let v = manager.mk_var(&format!("__oxiz_boolarg_{}", arg.0), bool_sort);
+            map.insert(arg, v);
+        }
+        let mut side: Vec<TermId> = Vec::with_capacity(map.len());
+        for (arg, v) in &map {
+            side.push(manager.mk_eq(*v, *arg));
+        }
+        let rewritten = manager.substitute(term, &map);
+        let mut parts = side;
+        parts.insert(0, rewritten);
+        manager.mk_and(parts)
+    }
+
+    /// Purify numeric (Int/Real) arguments of uninterpreted-function
+    /// applications into fresh shared variables, mirroring
+    /// [`Self::abstract_compound_bool_args`].
+    ///
+    /// `track_theory_vars` deliberately does not intern UF-application
+    /// arguments, so a constant or arithmetic-compound argument such as
+    /// `f(3)` or `f(fmt1 + 1)` is never an arithmetic interface term: an
+    /// arithmetic-derived equality like `y = 3` (from `y = x+1, x = 2`) cannot
+    /// propagate to EUF, and the congruence `f(y) = f(3)` never fires — the
+    /// root cause of the QF_UFLIA / QF_UFIDL false-SAT.  Replacing `f(arg)`
+    /// with `f(v)` plus the defining equality `v = arg` makes `v` a shared
+    /// term (UF argument + arithmetic variable via the equality), so the
+    /// Nelson-Oppen / model-based combination propagates `v = k` and EUF
+    /// congruence closes.  This is the standard Nelson-Oppen purification step
+    /// (cvc5's tight interface).
+    ///
+    /// Kinds already interned as shared arith terms by `track_theory_vars`
+    /// (Var, Apply, Select, Ite, Div, Mod, DtSelector) are left in place; only
+    /// constants and arithmetic compounds are abstracted.
+    pub(super) fn purify_numeric_uf_args(&mut self, term: TermId, manager: &mut TermManager) -> TermId {
+        use oxiz_core::ast::collect_subterms;
+        use rustc_hash::FxHashMap;
+        let int_sort = manager.sorts.int_sort;
+        let real_sort = manager.sorts.real_sort;
+        // Collect numeric constants that appear as a `Mul` factor: proxying one
+        // of these would (via the global `substitute`) rewrite the coefficient
+        // too, manufacturing spurious nonlinearity.  See the arg-scan note.
+        let mut coefficient_consts: rustc_hash::FxHashSet<TermId> = rustc_hash::FxHashSet::default();
+        for st in collect_subterms(term, manager) {
+            let Some(t) = manager.get(st) else { continue };
+            if let TermKind::Mul(args) = &t.kind {
+                for &a in args {
+                    if let Some(at) = manager.get(a) {
+                        if matches!(at.kind, TermKind::IntConst(_) | TermKind::RealConst(_)) {
+                            coefficient_consts.insert(a);
+                        }
+                    }
+                }
+            }
+        }
+        let mut to_abstract: Vec<TermId> = Vec::new();
+        for st in collect_subterms(term, manager) {
+            let Some(t) = manager.get(st) else { continue };
+            // Soundness: a fresh proxy variable is necessarily *free*, so it
+            // cannot replace a subterm under a true quantifier (`forall`/
+            // `exists`) -- it would escape the quantifier's scope and turn a
+            // satisfiable quantified formula unsatisfiable (observed on
+            // UFLIA/division_property).  `let`/`match` are transparent local
+            // bindings whose bound variables are already `Var`s (hence already
+            // shared, not abstracted), and their compound arguments reference
+            // only free declared variables, so purifying under them is sound;
+            // guarding them too would skip the QF_UFLIA `let`-heavy Wisa cases
+            // that most need purification.
+            if matches!(t.kind, TermKind::Forall { .. } | TermKind::Exists { .. }) {
+                return term;
+            }
+            if let TermKind::Apply { args, .. } = &t.kind {
+                for &arg in args {
+                    let Some(at) = manager.get(arg) else { continue };
+                    let numeric = at.sort == int_sort || at.sort == real_sort;
+                    let already_shared = matches!(
+                        at.kind,
+                        TermKind::Var(_)
+                            | TermKind::Apply { .. }
+                            | TermKind::Select(_, _)
+                            | TermKind::Ite(_, _, _)
+                            | TermKind::Div(_, _)
+                            | TermKind::Mod(_, _)
+                            | TermKind::DtSelector { .. }
+                    );
+                    // A constant that also appears as a `Mul` coefficient
+                    // elsewhere in the term must NOT be proxied: the global
+                    // `substitute` below would rewrite that coefficient too,
+                    // turning a linear `(* 4 x)` into the nonlinear
+                    // `(* proxy x)` and tripping the `arith_atoms_need_theory`
+                    // honesty gate.  Such a constant is the same `TermId` in
+                    // both roles (the interner dedups literals), so it cannot
+                    // be substituted in only one position via the global map.
+                    let is_const = matches!(at.kind, TermKind::IntConst(_) | TermKind::RealConst(_));
+                    if numeric && !already_shared && !(is_const && coefficient_consts.contains(&arg)) {
+                        to_abstract.push(arg);
+                    }
+                }
+            }
+        }
+        if to_abstract.is_empty() {
+            return term;
+        }
+        let mut map: FxHashMap<TermId, TermId> = FxHashMap::default();
+        for arg in to_abstract {
+            if map.contains_key(&arg) {
+                continue;
+            }
+            let Some(at) = manager.get(arg) else { continue };
+            let v = manager.mk_var(&format!("__oxiz_numarg_{}", arg.0), at.sort);
             map.insert(arg, v);
         }
         let mut side: Vec<TermId> = Vec::with_capacity(map.len());

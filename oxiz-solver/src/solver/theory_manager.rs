@@ -807,6 +807,35 @@ impl<'a> TheoryManager<'a> {
             for (a, b) in self.euf.live_diseq_pairs() {
                 candidates.insert(if a < b { (a, b) } else { (b, a) });
             }
+            // Model-equal shared-term pairs: arithmetic terms the simplex
+            // currently assigns the *same* value are candidates for an entailed
+            // equality (e.g. two purified UF-argument proxies `v1`, `v2` both
+            // pinned to `3`).  Difference-constraint pairs alone miss these, so
+            // without this the congruence `f(v1) = f(v2)` never fires.  Group
+            // the shared interface by arith value and add same-valued pairs
+            // (capped) for the probe.  Sound: `entailed_equal_reason`
+            // re-verifies entailment per pair.
+            const MAX_MODEL_EQ_PAIRS: usize = 1024;
+            let mut by_val: rustc_hash::FxHashMap<Rational64, Vec<TermId>> =
+                rustc_hash::FxHashMap::default();
+            for &t in self.arith.interface_terms() {
+                if let Some(v) = self.arith.value(t) {
+                    by_val.entry(v).or_default().push(t);
+                }
+            }
+            let mut added_pairs = 0usize;
+            for terms in by_val.values() {
+                if added_pairs >= MAX_MODEL_EQ_PAIRS { break; }
+                if terms.len() < 2 { continue; }
+                'pair: for i in 0..terms.len() {
+                    for j in (i + 1)..terms.len() {
+                        if added_pairs >= MAX_MODEL_EQ_PAIRS { break 'pair; }
+                        let (a, b) = (terms[i], terms[j]);
+                        candidates.insert(if a < b { (a, b) } else { (b, a) });
+                        added_pairs += 1;
+                    }
+                }
+            }
             let mut merged_any = false;
             for &(x, y) in &candidates {
                 let l_node = self.euf.intern(x);
