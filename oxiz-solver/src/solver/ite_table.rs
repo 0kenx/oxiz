@@ -291,7 +291,12 @@ impl Solver {
         term: TermId,
         manager: &mut TermManager,
     ) -> TermId {
-        if self.unit_eq_rep.is_empty() {
+        // The alias fold exists to give flattened table indices their define-fun
+        // names; without tables it only churns through ordinary `(= var var)`
+        // constraint equalities (tens of thousands on ite-heavy QF_UF), so gate
+        // it on table presence.  `note_unit_eq_alias` (the builder) stays
+        // ungated so aliases noted before a table appears are still available.
+        if self.unit_eq_rep.is_empty() || self.table_index_terms.is_empty() {
             return term;
         }
         let mut map: FxHashMap<TermId, TermId> = FxHashMap::default();

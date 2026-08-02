@@ -1383,8 +1383,15 @@ impl Solver {
             side.push(manager.mk_implies(not_c, eq_v_e));
         }
         // Preserve define-fun body aliases / table-index keys across mux rewrite.
-        self.rebind_aliases_through_map(manager, &map);
-        self.rebind_table_indices_through_map(manager, &map);
+        // The alias machinery exists only to help flattened table indices inherit
+        // bounds; with no tables it is pure overhead (on ite-heavy QF_UF like
+        // firewire, `unit_eq_rep` balloons to tens of thousands of ordinary
+        // `(= var var)` constraint equalities, and rebinding them per-mux turns a
+        // 1.5s solve into 23s).  Skip unless this formula actually has tables.
+        if !self.table_index_terms.is_empty() {
+            self.rebind_aliases_through_map(manager, &map);
+            self.rebind_table_indices_through_map(manager, &map);
+        }
         let rewritten = manager.substitute(term, &map);
         let mut parts = side;
         parts.insert(0, rewritten);
