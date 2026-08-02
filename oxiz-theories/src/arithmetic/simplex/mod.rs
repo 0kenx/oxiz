@@ -12,6 +12,114 @@ use oxiz_core::profiling::{ProfilingCategory, ScopedTimer};
 use smallvec::SmallVec;
 /// Variable index
 pub type VarId = u32;
+
+/// Throwaway diagnostic counters for the theory-combination probe-cost
+/// investigation (gated on `std`; print on `OXIZ_DIAG`).
+#[cfg(feature = "std")]
+pub mod diag {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    std::thread_local! { static PROBE: Cell<bool> = Cell::new(false); }
+    pub static CHECKS_TOTAL: AtomicU64 = AtomicU64::new(0);
+    pub static CHECKS_PROBE: AtomicU64 = AtomicU64::new(0);
+    pub static CRASH_TOTAL: AtomicU64 = AtomicU64::new(0);
+    pub static CRASH_PROBE: AtomicU64 = AtomicU64::new(0);
+    pub static PIVOTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+    pub static PIVOTS_PROBE: AtomicU64 = AtomicU64::new(0);
+    pub static CRASH_NS: AtomicU64 = AtomicU64::new(0);
+    pub static FEASIBLE_NS: AtomicU64 = AtomicU64::new(0);
+    /// Scoped wall-clock timer that adds elapsed nanos to `target` on drop
+    /// (so early returns in the timed function are covered).
+    pub struct Timer {
+        start: std::time::Instant,
+        target: &'static AtomicU64,
+    }
+    impl Timer {
+        pub fn new(target: &'static AtomicU64) -> Self {
+            Self { start: std::time::Instant::now(), target }
+        }
+    }
+    impl Drop for Timer {
+        fn drop(&mut self) {
+            self.target.fetch_add(self.start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+    #[inline]
+    fn probe() -> bool {
+        PROBE.with(|p| p.get())
+    }
+    pub fn reset() {
+        for c in [
+            &CHECKS_TOTAL, &CHECKS_PROBE, &CRASH_TOTAL, &CRASH_PROBE, &PIVOTS_TOTAL, &PIVOTS_PROBE,
+        ] {
+            c.store(0, Ordering::Relaxed);
+        }
+        CRASH_NS.store(0, Ordering::Relaxed);
+        FEASIBLE_NS.store(0, Ordering::Relaxed);
+    }
+    pub fn set_probe(on: bool) {
+        PROBE.with(|p| p.set(on));
+    }
+    /// RAII guard: clears the probe flag on drop, so `?` early returns in
+    /// `entailed_equal_reason` can't leak it onto subsequent non-probe checks.
+    pub struct ProbeFlagGuard;
+    impl Drop for ProbeFlagGuard {
+        fn drop(&mut self) {
+            set_probe(false);
+        }
+    }
+    pub(crate) fn inc_check() {
+        CHECKS_TOTAL.fetch_add(1, Ordering::Relaxed);
+        if probe() { CHECKS_PROBE.fetch_add(1, Ordering::Relaxed); }
+    }
+    pub(crate) fn inc_crash() {
+        CRASH_TOTAL.fetch_add(1, Ordering::Relaxed);
+        if probe() { CRASH_PROBE.fetch_add(1, Ordering::Relaxed); }
+    }
+    pub(crate) fn inc_pivot() {
+        PIVOTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+        if probe() { PIVOTS_PROBE.fetch_add(1, Ordering::Relaxed); }
+    }
+    pub fn print() {
+        let (ct, cp, krt, krp, pt, pp, cns, fns) = (
+            CHECKS_TOTAL.load(Ordering::Relaxed), CHECKS_PROBE.load(Ordering::Relaxed),
+            CRASH_TOTAL.load(Ordering::Relaxed), CRASH_PROBE.load(Ordering::Relaxed),
+            PIVOTS_TOTAL.load(Ordering::Relaxed), PIVOTS_PROBE.load(Ordering::Relaxed),
+            CRASH_NS.load(Ordering::Relaxed), FEASIBLE_NS.load(Ordering::Relaxed),
+        );
+        let npc = ct.saturating_sub(cp);
+        let npp = pt.saturating_sub(pp);
+        let per_probe = if cp > 0 { pp as f64 / cp as f64 } else { f64::NAN };
+        let per_solve = if npc > 0 { npp as f64 / npc as f64 } else { f64::NAN };
+        let ratio = if per_solve > 0.0 { per_probe / per_solve } else { f64::NAN };
+        let crash_per = if krt > 0 { cns as f64 / krt as f64 } else { 0.0 };
+        let feas_per = if ct > 0 { fns as f64 / ct as f64 } else { 0.0 };
+        eprintln!(
+            "[diag] checks total={} probe={} | crash_basis total={} probe={} | pivots total={} probe={}",
+            ct, cp, krt, krp, pt, pp
+        );
+        eprintln!(
+            "[diag] pivots/check: probe={:.1}  solve={:.1}  ratio={:.2}x",
+            per_probe, per_solve, ratio
+        );
+        eprintln!(
+            "[diag] ns/call: crash_basis={:.0}  make_feasible={:.0}",
+            crash_per, feas_per
+        );
+    }
+    /// Print timing shares against the total solve wall-clock.
+    pub fn print_timing(total_ns: u64) {
+        let cns = CRASH_NS.load(Ordering::Relaxed);
+        let fns = FEASIBLE_NS.load(Ordering::Relaxed);
+        let tf = fns as f64 / total_ns as f64 * 100.0;
+        let tc = cns as f64 / total_ns as f64 * 100.0;
+        let tms = total_ns as f64 / 1_000_000.0;
+        eprintln!(
+            "[diag] wall={:.0}ms  crash_basis={:.1}%  make_feasible={:.1}%",
+            tms, tc, tf
+        );
+    }
+}
 /// GCD of two `i128` values (used by the checked-rational helpers below to
 /// reduce results computed via `i128` intermediates before narrowing back
 /// to `i64`).
@@ -336,6 +444,14 @@ pub struct Simplex {
     /// resource-limited run), and callers deciding satisfiability have to report
     /// `Unknown` rather than `Sat`.  See [`Simplex::resource_limit_reached`].
     resource_limit: bool,
+    /// Whether `assignment[]` is consistent with the current tableau+bounds
+    /// (incrementally maintained on `add_le`/basic-bound changes).  When true,
+    /// `check()` may skip the O(tableau) `crash_basis` re-derivation and go
+    /// straight to `make_feasible`.  Conservatively cleared on non-basic bound
+    /// changes and on `pop` (where restoring is cheaper than proving
+    /// consistency).  Dutertre–de-Ma-style incremental assignment, adapted to
+    /// oxiz's slack-per-constraint tableau.
+    assignment_current: bool,
 }
 impl Default for Simplex {
     fn default() -> Self {
@@ -368,6 +484,7 @@ impl Simplex {
             pivoting_rule: config.pivoting_rule,
             max_pivots: config.max_pivots,
             resource_limit: false,
+            assignment_current: true,
         }
     }
     /// Whether the most recent feasibility run (`check` / `dual_simplex`) gave up
@@ -548,6 +665,7 @@ impl Simplex {
             reason,
             aux_reasons: SmallVec::new(),
         });
+        self.note_bound_change(idx);
     }
     /// Set a lower bound directly from a `DeltaRational` (supports strict
     /// bounds carrying an infinitesimal `δ` component), pushing an undo
@@ -578,6 +696,7 @@ impl Simplex {
             reason,
             aux_reasons,
         });
+        self.note_bound_change(idx);
     }
     /// Set an upper bound directly from a `DeltaRational`; see
     /// [`Self::set_lower_delta`].
@@ -600,6 +719,7 @@ impl Simplex {
             reason,
             aux_reasons,
         });
+        self.note_bound_change(idx);
     }
     /// Set a strict lower bound (x > value), represented as x >= value + δ
     pub fn set_strict_lower(&mut self, var: VarId, value: Rational64, reason: u32) {
@@ -618,6 +738,7 @@ impl Simplex {
             reason,
             aux_reasons: SmallVec::new(),
         });
+        self.note_bound_change(idx);
     }
     /// Set an upper bound (x <= value)
     pub fn set_upper(&mut self, var: VarId, value: Rational64, reason: u32) {
@@ -636,6 +757,7 @@ impl Simplex {
             reason,
             aux_reasons: SmallVec::new(),
         });
+        self.note_bound_change(idx);
     }
     /// Set a strict upper bound (x < value), represented as x <= value - δ
     pub fn set_strict_upper(&mut self, var: VarId, value: Rational64, reason: u32) {
@@ -654,6 +776,7 @@ impl Simplex {
             reason,
             aux_reasons: SmallVec::new(),
         });
+        self.note_bound_change(idx);
     }
     /// Add a constraint: expr <= 0
     pub fn add_le(&mut self, mut expr: LinExpr, reason: u32) {
@@ -690,6 +813,25 @@ impl Simplex {
         }
         self.basic[slack as usize] = true;
         self.set_lower(slack, Rational64::zero(), reason);
+        // Dutertre–de-Ma incremental assignment: the new basic slack's row
+        // references only non-basic variables (basic vars were substituted
+        // out above), whose assignments are current, so compute the slack's
+        // assignment from its row in O(row) instead of forcing `check()` to
+        // re-derive the whole tableau via `crash_basis`.
+        if self.assignment_current {
+            let val = {
+                let row = self.tableau.get(&slack).expect("slack row just inserted");
+                let mut v = DeltaRational::from_rational(row.constant);
+                for (vr, c) in &row.terms {
+                    let vi = *vr as usize;
+                    if vi < self.assignment.len() {
+                        v += self.assignment[vi] * *c;
+                    }
+                }
+                v
+            };
+            self.assignment[slack as usize] = val;
+        }
     }
     /// Add a constraint: expr >= 0
     pub fn add_ge(&mut self, mut expr: LinExpr, reason: u32) {
@@ -732,6 +874,9 @@ impl Simplex {
         }
         self.tableau.insert(slack, slack_expr);
         self.set_strict_lower(slack, Rational64::zero(), reason);
+        // The new slack's assignment is not computed here (strict-bound slack);
+        // conservatively mark stale so `check()` re-derives via `crash_basis`.
+        self.assignment_current = false;
     }
     /// Add a strict constraint: expr > 0
     /// Uses infinitesimals: -expr < 0
@@ -741,6 +886,8 @@ impl Simplex {
     }
     /// Check if bounds are consistent
     pub fn check(&mut self) -> Result<(), Vec<u32>> {
+        #[cfg(feature = "std")]
+        diag::inc_check();
         self.resource_limit = false;
         for i in 0..self.assignment.len() {
             if let (Some(lo), Some(hi)) = (&self.lower[i], &self.upper[i])
@@ -759,7 +906,14 @@ impl Simplex {
                 return Err(conflict);
             }
         }
-        self.crash_basis();
+        // Skip the O(tableau) `crash_basis` re-derivation when the assignment
+        // is already current (maintained incrementally by `add_le` on basic
+        // slacks and left untouched by basic-bound changes).  Non-basic bound
+        // changes and `pop` clear the flag, falling back to the full path.
+        if !self.assignment_current {
+            self.crash_basis();
+            self.assignment_current = true;
+        }
         self.make_feasible()
     }
     /// Crash basis initialization for faster convergence
@@ -775,6 +929,10 @@ impl Simplex {
     ///
     /// Reference: Koberstein's crash procedure for MIP solvers
     fn crash_basis(&mut self) {
+        #[cfg(feature = "std")]
+        let _t = diag::Timer::new(&diag::CRASH_NS);
+        #[cfg(feature = "std")]
+        diag::inc_crash();
         for i in 0..self.assignment.len() {
             if i < self.basic.len() && self.basic[i] {
                 continue;
@@ -807,6 +965,8 @@ impl Simplex {
             let pivot_col = self.find_pivot_col(basic_var, &bound);
             match pivot_col {
                 Some(nonbasic_var) => {
+                    #[cfg(feature = "std")]
+                    diag::inc_pivot();
                     if !self.pivot(basic_var, nonbasic_var) {
                         return Ok(());
                     }
@@ -1552,6 +1712,7 @@ impl Simplex {
         self.cached_assignments.clear();
         self.saved_tableaux.clear();
         self.resource_limit = false;
+        self.assignment_current = true;
     }
     /// Push a new decision level
     pub fn push(&mut self) {
@@ -1562,6 +1723,7 @@ impl Simplex {
     }
     /// Pop to previous decision level
     pub fn pop(&mut self) {
+        self.assignment_current = false;
         if let Some(limit) = self.trail_limits.pop() {
             while self.trail.len() > limit {
                 if let Some(undo) = self.trail.pop() {
@@ -1662,6 +1824,16 @@ impl Simplex {
     #[inline]
     pub(super) fn is_basic(&self, idx: usize) -> bool {
         idx < self.basic.len() && self.basic[idx]
+    }
+    /// A non-basic variable's bound change means its assignment must snap to the
+    /// new bound and the basics in its column shift -- without a column index we
+    /// conservatively mark the assignment stale so `check()` re-derives.  Basic
+    /// bound changes don't move the assignment (it's tableau-derived), so the
+    /// flag stays and `check()` skips `crash_basis`.
+    fn note_bound_change(&mut self, idx: usize) {
+        if !self.is_basic(idx) {
+            self.assignment_current = false;
+        }
     }
     /// Iterate over `(basic_var, row)` pairs in the tableau.
     pub(super) fn tableau_iter(&self) -> impl Iterator<Item = (&VarId, &LinExpr)> {

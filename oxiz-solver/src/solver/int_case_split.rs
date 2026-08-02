@@ -127,9 +127,15 @@ impl Solver {
     /// `false` when there is nothing more to split — the candidate `sat` then
     /// stands.
     pub(super) fn refine_int_case_split(&mut self, manager: &mut TermManager) -> bool {
-        if !self.arith.is_integer() {
-            return false;
-        }
+        // Not gated on `self.arith.is_integer()`: the Solver always constructs
+        // `ArithSolver::lra()` (is_integer == false), so that guard disabled
+        // this non-convexity refinement entirely -- dead code, and the source
+        // of the QF_UFLIA/QF_UFIDL false-SAT (an integer UF argument pinned to
+        // a small finite domain never gets its `(or (= t lo) ... (= t hi))`
+        // lemma, so CDCL cannot branch on its value and a genuine `unsat` is
+        // reported `sat`).  Int-sorted UF arguments are selected by
+        // `collect_int_uf_args` (int_sort only); Real arguments are never
+        // enumerated, so dropping the global flag is sound.
         if self.case_split_rounds >= MAX_CASE_SPLIT_ROUNDS {
             return false;
         }
@@ -173,10 +179,6 @@ impl Solver {
                 let eq = manager.mk_eq(term, int_k);
                 lits.push(self.encode_depth(eq, manager, 0));
             }
-            // At-least-one only.  Pairwise at-most-one here regresses WiSA-style
-            // QF_UFLIA (extra binary clauses disrupt CDCL without helping UF
-            // congruence).  Table-index splits add at-most-one separately in
-            // `eager_table_index_case_split` where covering-OR unit-prop needs it.
             self.sat.add_clause(lits);
             self.case_split_terms.insert(term);
         }
@@ -210,7 +212,7 @@ impl Solver {
                     let Some(at) = manager.get(arg) else {
                         continue;
                     };
-                    if at.sort != int_sort && at.sort != real_sort {
+                    if at.sort != int_sort {
                         continue;
                     }
                     if seen.insert(arg) {

@@ -10,7 +10,7 @@ mod delta;
 mod gaussian;
 mod lia;
 mod optimize;
-mod simplex;
+pub(crate) mod simplex;
 mod simplex_opt;
 mod solver;
 

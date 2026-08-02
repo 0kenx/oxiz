@@ -1,0 +1,21 @@
+;; expected: sat
+; Nested define-fun (let + abs/ite + select) inside multi-factor product range
+(set-logic QF_ANIA)
+(declare-const i Int)
+(declare-const t Int)
+(declare-const A (Array Int Int))
+(declare-const B (Array Int Int))
+(declare-const C (Array Int Int))
+(declare-const D (Array Int Int))
+(assert (= A (store (store ((as const (Array Int Int)) 0) 1 30) 2 32)))
+(assert (= B (store (store ((as const (Array Int Int)) 0) 1 76) 2 74)))
+(assert (= C (store (store ((as const (Array Int Int)) 0) 1 5) 2 5)))
+(assert (= D (store (store ((as const (Array Int Int)) 0) 1 3) 2 3)))
+(define-fun absi ((x Int)) Int (ite (< x 0) (- x) x))
+(define-fun w ((k Int) (s Int)) Int
+  (let ((d (absi (- s (select C k)))))
+    (ite (<= d (select D k)) 10 (ite (<= d (* 2 (select D k))) 6 0))))
+(assert (and (>= i 1) (<= i 2) (>= t 1) (<= t 9)
+  (>= (* (select A i) (select B i) (w i t) 10) 200000)
+  (<= (* (select A i) (select B i) (w i t) 10) 300000)))
+(check-sat)

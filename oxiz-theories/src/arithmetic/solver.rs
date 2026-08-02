@@ -160,6 +160,22 @@ impl ArithSolver {
         self.is_integer
     }
 
+    /// Diagnostic: reset the theory-combination probe counters.
+    #[cfg(feature = "std")]
+    pub fn diag_reset(&mut self) {
+        super::simplex::diag::reset();
+    }
+    /// Diagnostic: print the theory-combination probe counters.
+    #[cfg(feature = "std")]
+    pub fn diag_print(&mut self) {
+        super::simplex::diag::print();
+    }
+    /// Diagnostic: print timing shares against total solve wall-clock (ns).
+    #[cfg(feature = "std")]
+    pub fn diag_print_timing(&mut self, total_ns: u64) {
+        super::simplex::diag::print_timing(total_ns);
+    }
+
     /// Intern a term as a variable
     pub fn intern(&mut self, term: TermId) -> VarId {
         if let Some(&var) = self.term_to_var.get(&term) {

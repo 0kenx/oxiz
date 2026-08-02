@@ -98,8 +98,11 @@ pub mod wmaxsat;
 
 // === std-only modules ===
 #[cfg(feature = "std")]
-pub mod checking;
+pub mod ania_ground;
 #[cfg(feature = "std")]
+pub mod checking;
+pub mod nia_cdcl;
+pub mod nl_model_search;
 pub mod nlsat;
 #[cfg(feature = "std")]
 pub mod sls;

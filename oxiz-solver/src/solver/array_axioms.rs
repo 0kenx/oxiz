@@ -39,7 +39,7 @@
 #[allow(unused_imports)]
 use crate::prelude::*;
 use oxiz_core::SortKind;
-use oxiz_core::ast::{TermId, TermKind, TermManager};
+use oxiz_core::ast::{get_children, TermId, TermKind, TermManager};
 use oxiz_core::sort::SortId;
 
 use super::{EvalVal, Solver};
@@ -206,7 +206,7 @@ fn collect_array_structure(
                 stack.push(*lhs);
             }
             _ => {
-                stack.extend(term_children(&data.kind).into_iter().rev());
+                stack.extend(get_children(&data.kind).into_iter().rev());
             }
         }
     }
@@ -385,21 +385,6 @@ fn array_domain(term: TermId, manager: &TermManager) -> Option<SortId> {
     }
 }
 
-/// Immediate sub-terms of a term kind that the structural walk should descend
-/// into for the operators not handled explicitly by `collect_array_structure`.
-/// Only the connectives / shapes that can legitimately contain array sub-terms
-/// need to be exhaustive; anything else contributes no children.
-fn term_children(kind: &TermKind) -> Vec<TermId> {
-    match kind {
-        TermKind::Not(a) | TermKind::Neg(a) => vec![*a],
-        TermKind::And(args) | TermKind::Or(args) => args.to_vec(),
-        TermKind::Distinct(args) => args.to_vec(),
-        TermKind::Implies(a, b) | TermKind::Xor(a, b) => vec![*a, *b],
-        TermKind::Ite(c, t, e) => vec![*c, *t, *e],
-        TermKind::Apply { args, .. } => args.to_vec(),
-        _ => Vec::new(),
-    }
-}
 
 #[cfg(test)]
 mod s8_iterative_tests {

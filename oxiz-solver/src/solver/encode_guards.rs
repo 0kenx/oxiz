@@ -204,11 +204,30 @@ impl Solver {
                         stack.push(a);
                     }
                 }
-                TermKind::Sub(a, b) => {
+                TermKind::Sub(a, b)
+                | TermKind::Eq(a, b)
+                | TermKind::Lt(a, b)
+                | TermKind::Le(a, b)
+                | TermKind::Gt(a, b)
+                | TermKind::Ge(a, b) => {
                     stack.push(*a);
                     stack.push(*b);
                 }
-                TermKind::Neg(a) => stack.push(*a),
+                TermKind::Neg(a) | TermKind::Not(a) => stack.push(*a),
+                TermKind::And(args) | TermKind::Or(args) | TermKind::Distinct(args) => {
+                    for &a in args {
+                        stack.push(a);
+                    }
+                }
+                // `let` is transparent — walk into it so a nonlinear product
+                // bound by a let is seen (otherwise CDCL returned spurious sat
+                // on let/ite-heavy industrial QF_NIA).
+                TermKind::Let { bindings, body } => {
+                    for &(_, v) in bindings.iter() {
+                        stack.push(v);
+                    }
+                    stack.push(*body);
+                }
                 _ => {}
             }
         }

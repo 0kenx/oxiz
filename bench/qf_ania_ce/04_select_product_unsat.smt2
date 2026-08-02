@@ -1,0 +1,12 @@
+;; expected: unsat
+; select values in 1..3, product = 7 (prime)
+(set-logic QF_ANIA)
+(declare-const A (Array Int Int))
+(declare-const B (Array Int Int))
+(declare-const i Int)
+(declare-const j Int)
+(assert (and (>= i 1) (<= i 3) (>= j 1) (<= j 3)
+             (>= (select A i) 1) (<= (select A i) 3)
+             (>= (select B j) 1) (<= (select B j) 3)
+             (= (* (select A i) (select B j)) 7)))
+(check-sat)

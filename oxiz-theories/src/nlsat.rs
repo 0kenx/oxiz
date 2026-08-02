@@ -36,16 +36,40 @@ use std::collections::HashMap;
 // Public result type for dispatch functions
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Concrete arithmetic assignment produced by a nonlinear decision procedure.
+///
+/// Keys are free arithmetic terms (`Var`, purified `select` constants, …);
+/// values are the rational witnesses found by NIA/NRA/ANIA ground search.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NlSatModel {
+    /// TermId → rational value for every free arithmetic variable assigned.
+    pub assignments: HashMap<TermId, BigRational>,
+}
+
 /// The definitive result from a nonlinear dispatch call.
 ///
 /// `Unknown` is not included: `dispatch_*` functions return `None` to signal
 /// "fall through to CDCL(T)" instead of wrapping Unknown.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NlDispatchResult {
-    /// The constraint set is satisfiable.
-    Sat,
+    /// The constraint set is satisfiable, with a concrete model witness.
+    Sat(NlSatModel),
     /// The constraint set is unsatisfiable.
     Unsat,
+}
+
+impl NlDispatchResult {
+    /// Satisfiable with an empty assignment map (defaults fill gaps).
+    #[must_use]
+    pub fn sat_empty() -> Self {
+        Self::Sat(NlSatModel::default())
+    }
+
+    /// Satisfiable with the given term→value map.
+    #[must_use]
+    pub fn sat_with(assignments: HashMap<TermId, BigRational>) -> Self {
+        Self::Sat(NlSatModel { assignments })
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -483,7 +507,10 @@ pub fn term_is_nonlinear(term_id: TermId, manager: &TermManager) -> bool {
                 }
                 stack.extend(args.iter().copied());
             }
-            TermKind::Add(args) | TermKind::And(args) => stack.extend(args.iter().copied()),
+            TermKind::Add(args)
+            | TermKind::And(args)
+            | TermKind::Or(args)
+            | TermKind::Distinct(args) => stack.extend(args.iter().copied()),
             TermKind::Sub(lhs, rhs)
             | TermKind::Eq(lhs, rhs)
             | TermKind::Gt(lhs, rhs)
@@ -493,7 +520,21 @@ pub fn term_is_nonlinear(term_id: TermId, manager: &TermManager) -> bool {
                 stack.push(*lhs);
                 stack.push(*rhs);
             }
-            TermKind::Neg(inner) => stack.push(*inner),
+            TermKind::Neg(inner) | TermKind::Not(inner) => stack.push(*inner),
+            // Walk into ite/let so nonlinear products nested under them are
+            // detected (industrial QF_NIA VCs are let/ite-heavy; without this
+            // NL dispatch never engaged and CDCL returned spurious sat).
+            TermKind::Ite(c, t, e) => {
+                stack.push(*c);
+                stack.push(*t);
+                stack.push(*e);
+            }
+            TermKind::Let { bindings, body } => {
+                for &(_, v) in bindings.iter() {
+                    stack.push(v);
+                }
+                stack.push(*body);
+            }
             _ => {}
         }
     }
@@ -561,11 +602,39 @@ fn contains_non_polynomial_ops(term_id: TermId, manager: &TermManager) -> bool {
                 stack.push(*lhs);
                 stack.push(*rhs);
             }
-            TermKind::Apply { .. }
-            | TermKind::Forall { .. }
-            | TermKind::Exists { .. }
-            | TermKind::Let { .. }
-            | TermKind::Match { .. } => return true,
+            TermKind::Apply { args, .. } => {
+                // A numeric-sorted application is an opaque poly var after
+                // purification; only a non-numeric application is foreign.
+                if !is_numeric_sort(manager, term.sort) {
+                    return true;
+                }
+                stack.extend(args.iter().copied());
+            }
+            TermKind::Select(arr, idx) => {
+                if !is_numeric_sort(manager, term.sort) {
+                    return true;
+                }
+                stack.push(*arr);
+                stack.push(*idx);
+            }
+            // `store` is an array op, not arithmetic; walk children so a store
+            // of something genuinely non-polynomial is still detected.
+            TermKind::Store(a, i, v) => {
+                stack.push(*a);
+                stack.push(*i);
+                stack.push(*v);
+            }
+            TermKind::Forall { .. } | TermKind::Exists { .. } | TermKind::Match { .. } => {
+                return true;
+            }
+            // `let` is a transparent local binding — walk into it so a
+            // nonlinear product bound by a let is still detected.
+            TermKind::Let { bindings, body } => {
+                for &(_, v) in bindings.iter() {
+                    stack.push(v);
+                }
+                stack.push(*body);
+            }
             TermKind::Neg(inner) | TermKind::Not(inner) => stack.push(*inner),
             TermKind::Add(args)
             | TermKind::Mul(args)
@@ -612,8 +681,56 @@ struct PolyAtom {
 // Assertion-level translation (integer mode)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Extract polynomial atoms from a top-level assertion.
-///
+/// Whether `sort` is Int or Real.
+fn is_numeric_sort(manager: &TermManager, sort: oxiz_core::sort::SortId) -> bool {
+    sort == manager.sorts.int_sort || sort == manager.sorts.real_sort
+}
+
+fn is_array_sort_id(manager: &TermManager, sort: oxiz_core::sort::SortId) -> bool {
+    manager
+        .sorts
+        .get(sort)
+        .is_some_and(|s| matches!(s.kind, oxiz_core::sort::SortKind::Array { .. }))
+}
+
+/// A top-level equality whose operands are array-sorted (or one is) is an
+/// array-theory structural fact, not an arithmetic constraint — skip it.
+fn is_array_structural_eq(manager: &TermManager, lhs: TermId, rhs: TermId) -> bool {
+    let ls = manager.get(lhs).map(|t| t.sort);
+    let rs = manager.get(rhs).map(|t| t.sort);
+    ls.is_some_and(|s| is_array_sort_id(manager, s))
+        || rs.is_some_and(|s| is_array_sort_id(manager, s))
+}
+
+/// A purification interface naming: `c = select(...)` / `c = f(...)` where one
+/// side is a fresh Var and the other a foreign numeric term. Encoding the
+/// foreign side as a second poly var would leave it unbounded, so the pure
+/// arith fragment must skip these (purification already bound `c`).
+fn is_arith_interface_eq(manager: &TermManager, lhs: TermId, rhs: TermId) -> bool {
+    fn is_var(manager: &TermManager, t: TermId) -> bool {
+        manager
+            .get(t)
+            .is_some_and(|n| matches!(n.kind, TermKind::Var(_)))
+    }
+    fn is_foreign_numeric(manager: &TermManager, t: TermId) -> bool {
+        let Some(n) = manager.get(t) else {
+            return false;
+        };
+        if !is_numeric_sort(manager, n.sort) {
+            return false;
+        }
+        matches!(
+            n.kind,
+            TermKind::Select(_, _)
+                | TermKind::Apply { .. }
+                | TermKind::Store(_, _, _)
+                | TermKind::Ite(_, _, _)
+        )
+    }
+    (is_var(manager, lhs) && is_foreign_numeric(manager, rhs))
+        || (is_var(manager, rhs) && is_foreign_numeric(manager, lhs))
+}
+
 /// `incomplete` is set to `true` whenever some part of the assertion could
 /// **not** be captured as a pure conjunction of polynomial atoms — an
 /// unrecognized top-level connective (`Or`/`Not`/`Distinct`/`Ite`/…) or a
@@ -642,6 +759,15 @@ fn extract_poly_atoms(
         let kind = term.kind.clone();
         match &kind {
             TermKind::Eq(lhs, rhs) => {
+                // Array structural equalities and purification interface namings
+                // (`c = select(...)`) are not arithmetic constraints: skip them
+                // so the pure-arith fragment does not encode an unbounded second
+                // var for the foreign side.
+                if is_array_structural_eq(manager, *lhs, *rhs)
+                    || is_arith_interface_eq(manager, *lhs, *rhs)
+                {
+                    continue;
+                }
                 if let (Some(lp), Some(rp)) =
                     (translator.translate(*lhs), translator.translate(*rhs))
                 {
@@ -730,13 +856,13 @@ fn extract_poly_atoms(
 ///
 /// Returns:
 /// - `Some(NlDispatchResult::Unsat)` if the system is provably UNSAT,
-/// - `Some(NlDispatchResult::Sat)` if NiaSolver finds an integer model,
+/// - `Some(NlDispatchResult::Sat(_))` if NiaSolver finds an integer model,
 /// - `None` if translation yields no atoms or the solver returns Unknown.
 ///
 /// Both linear and nonlinear assertions are passed so the solver has full context.
 pub fn dispatch_nia_constraints(
     assertions: &[TermId],
-    manager: &TermManager,
+    manager: &mut TermManager,
     integer_mode: bool,
 ) -> Option<NlDispatchResult> {
     let has_nl = assertions.iter().any(|&a| term_is_nonlinear(a, manager));
@@ -746,9 +872,49 @@ pub fn dispatch_nia_constraints(
     if !has_nl && !has_divmod {
         return None;
     }
+
+    // Optional CDCL(T) search (z3-style theory_arith_nl port): Tseitin CNF over
+    // arithmetic atoms + 1-UIP lemma learning + Simplex theory. Opt-in via
+    // `OXIZ_NIA_CDCL` so the default path is unaffected; soundness-safe (Sat
+    // is concretely verified; Unsat only from a level-0 relaxation conflict).
+    #[cfg(feature = "std")]
+    if std::env::var("OXIZ_NIA_CDCL").is_ok()
+        && let Some(r) = crate::nia_cdcl::cdcl_nia_search(assertions, manager)
+    {
+        return Some(r);
+    }
+
+    // Ground store-chains + finite index boxes: decide by evaluating selects
+    // (sound for QF_ANIA). Runs before the pure-arith relaxation so we never
+    // report Sat from free select-vars when stores constrain them.
+    if crate::ania_ground::assertions_contain_store(assertions, manager)
+        && let Some(r) = crate::ania_ground::try_decide_ground_ania(assertions, manager)
+    {
+        return Some(r);
+    }
+    // Finite-domain enumeration for pure nonlinear-integer formulas whose
+    // free integer vars lie in small boxes (e.g. lookup-table products over
+    // bounded indices). The relaxation-based NIA core routinely returns
+    // Unknown on these; exhaustive substitution decides them.
+    if let Some(r) = crate::ania_ground::try_decide_finite_domain_nia(assertions, manager) {
+        return Some(r);
+    }
+    // Model-based nonlinear search (z3-style): linearise monomials into fresh
+    // Simplex vars, solve the relaxation (sound Unsat on infeasibility), then
+    // bounded concrete enumeration that verifies the full formula before Sat.
+    // Catches the industrial QF_NIA termination-VC SAT instances the CAD core
+    // bails on.
+    if let Some(r) = crate::nl_model_search::try_model_based_nia_search(assertions, manager) {
+        return Some(r);
+    }
+
     let has_unsupported_ops = assertions
         .iter()
         .any(|&a| contains_non_polynomial_ops(a, manager));
+    // Store-definitions further constrain purified select constants, so a Sat
+    // from the pure-arith relaxation can over-approximate when stores are
+    // present (free select-vars). Tracked separately to gate `sat_is_trustworthy`.
+    let has_array_stores = crate::ania_ground::assertions_contain_store(assertions, manager);
 
     let config = NiaConfig {
         enable_cutting_planes: true,
@@ -788,8 +954,12 @@ pub fn dispatch_nia_constraints(
     // set as a conjunction of translatable atoms. If any top-level term was
     // dropped (a disjunction, an untranslatable operand, …) the solver worked
     // on a strictly weaker problem, so its model may violate the dropped
-    // constraint — fall through to CDCL(T) instead of trusting Sat.
-    let sat_is_trustworthy = !incomplete;
+    // constraint — fall through to CDCL(T) instead of trusting Sat. Array
+    // `store` definitions likewise constrain purified select constants beyond
+    // the pure-arith relaxation, so a store-bearing formula's Sat is not
+    // trustworthy from this path (the ground-ANIA pre-check handles the
+    // decidable store-chain cases directly).
+    let sat_is_trustworthy = !incomplete && !has_array_stores;
 
     for atom in &poly_atoms {
         let atom_id = translator
@@ -804,10 +974,27 @@ pub fn dispatch_nia_constraints(
     }
 
     match translator.nlsat.solve() {
-        SolverResult::Sat if sat_is_trustworthy => Some(NlDispatchResult::Sat),
+        SolverResult::Sat if sat_is_trustworthy => {
+            let model = extract_nia_model(&translator);
+            Some(NlDispatchResult::sat_with(model))
+        }
         SolverResult::Unsat if unsat_is_trustworthy => Some(NlDispatchResult::Unsat),
         SolverResult::Sat | SolverResult::Unsat | SolverResult::Unknown => None,
     }
+}
+
+/// Map NIA poly-var indices back to TermIds via the translator cache.
+fn extract_nia_model(translator: &TermPolyTranslator<'_>) -> HashMap<TermId, BigRational> {
+    let mut out = HashMap::new();
+    let Some(nlsat_model) = translator.nlsat.nlsat().get_model() else {
+        return out;
+    };
+    for (&term, &poly_var) in translator.var_cache() {
+        if let Some(val) = nlsat_model.arith_value(poly_var) {
+            out.insert(term, val.clone());
+        }
+    }
+    out
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -842,6 +1029,24 @@ impl<'a> RealPolyTranslator<'a> {
         self.var_cache.insert(term_id, v);
         v
     }
+
+    fn var_cache(&self) -> &HashMap<TermId, u32> {
+        &self.var_cache
+    }
+}
+
+/// Map NRA poly-var indices back to TermIds via the translator cache.
+fn extract_nra_model(translator: &RealPolyTranslator<'_>) -> HashMap<TermId, BigRational> {
+    let mut out = HashMap::new();
+    let Some(nlsat_model) = translator.nlsat.get_model() else {
+        return out;
+    };
+    for (&term, &poly_var) in translator.var_cache() {
+        if let Some(val) = nlsat_model.arith_value(poly_var) {
+            out.insert(term, val.clone());
+        }
+    }
+    out
 }
 
 impl PolyVarSource for RealPolyTranslator<'_> {
@@ -872,6 +1077,15 @@ fn extract_real_poly_atoms(
         let kind = term.kind.clone();
         match &kind {
             TermKind::Eq(lhs, rhs) => {
+                // Array structural equalities and purification interface namings
+                // (`c = select(...)`) are not arithmetic constraints: skip them
+                // so the pure-arith fragment does not encode an unbounded second
+                // var for the foreign side.
+                if is_array_structural_eq(manager, *lhs, *rhs)
+                    || is_arith_interface_eq(manager, *lhs, *rhs)
+                {
+                    continue;
+                }
                 if let (Some(lp), Some(rp)) =
                     (translator.translate(*lhs), translator.translate(*rhs))
                 {
@@ -947,7 +1161,7 @@ fn extract_real_poly_atoms(
 /// Dispatch nonlinear real arithmetic assertions to `NlsatSolver`.
 pub fn dispatch_nra_constraints(
     assertions: &[TermId],
-    manager: &TermManager,
+    manager: &mut TermManager,
 ) -> Option<NlDispatchResult> {
     let has_nl = assertions.iter().any(|&a| term_is_nonlinear(a, manager));
     if !has_nl {
@@ -985,7 +1199,10 @@ pub fn dispatch_nra_constraints(
     }
 
     match translator.nlsat.solve() {
-        SolverResult::Sat if sat_is_trustworthy => Some(NlDispatchResult::Sat),
+        SolverResult::Sat if sat_is_trustworthy => {
+            let model = extract_nra_model(&translator);
+            Some(NlDispatchResult::sat_with(model))
+        }
         SolverResult::Unsat if unsat_is_trustworthy => Some(NlDispatchResult::Unsat),
         SolverResult::Sat | SolverResult::Unsat | SolverResult::Unknown => None,
     }
@@ -1370,10 +1587,10 @@ mod tests {
         let square = manager.mk_mul(vec![x, x]);
         let four = manager.mk_int(4);
         let eq = manager.mk_eq(square, four);
-        let result = dispatch_nia_constraints(&[eq], &manager, true);
+        let result = dispatch_nia_constraints(&[eq], &mut manager, true);
         // SAT or Unknown (unknown means solver fell through)
         assert!(
-            matches!(result, Some(NlDispatchResult::Sat) | None),
+            matches!(result, Some(NlDispatchResult::Sat(_)) | None),
             "x*x=4 should be SAT or unknown, got {:?}",
             result
         );
@@ -1388,7 +1605,7 @@ mod tests {
         let square = manager.mk_mul(vec![x, x]);
         let neg_one = manager.mk_int(-1);
         let eq = manager.mk_eq(square, neg_one);
-        let result = dispatch_nia_constraints(&[eq], &manager, true);
+        let result = dispatch_nia_constraints(&[eq], &mut manager, true);
         assert!(
             matches!(result, Some(NlDispatchResult::Unsat) | None),
             "x*x=-1 should be UNSAT or unknown, got {:?}",
@@ -1405,7 +1622,7 @@ mod tests {
         let square = manager.mk_mul(vec![x, x]);
         let zero = manager.mk_int(0);
         let lt = manager.mk_lt(square, zero);
-        let result = dispatch_nra_constraints(&[lt], &manager);
+        let result = dispatch_nra_constraints(&[lt], &mut manager);
         assert!(
             matches!(result, Some(NlDispatchResult::Unsat) | None),
             "x*x<0 should be UNSAT or unknown, got {:?}",

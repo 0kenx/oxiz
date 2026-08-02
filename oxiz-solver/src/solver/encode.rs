@@ -496,6 +496,25 @@ impl Solver {
     /// `Solver::invalidate_results` (private) for the rule and for why the unsat
     /// core goes with it.
     pub fn assert(&mut self, term: TermId, manager: &mut TermManager) {
+        // Depth guard FIRST.  The recursive pre-processing passes below
+        // (`fold_unit_eq_reps` / `flatten_eq_ite_tables` / `purify_arith` / …)
+        // walk the assertion term and would overflow the native call stack on a
+        // deeply-nested input *before* the later encode-depth check (which only
+        // protects the Tseitin encoder) ever runs.  `term_exceeds_encode_depth`
+        // is an explicit-stack scan, so probing here is itself stack-safe; on a
+        // too-deep term we flag the incomplete encoding, record the assertion,
+        // and return without recursing, so `check` answers `Unknown` instead of
+        // crashing the process.
+        if self.term_exceeds_encode_depth(term, manager) {
+            self.encode_depth_exceeded = true;
+            let index = self.assertions.len();
+            self.assertions.push(term);
+            self.trail.push(TrailOp::AssertionAdded { index });
+            self.invalidate_fp_cache();
+            self.invalidate_results();
+            self.record_assertion_identity(term, None, index);
+            return;
+        }
         // Replace inlined nullary define-fun bodies with their named consts
         // (parser expands bindings at parse time).  Prevents re-flattening
         // Discord/EM/R on every later assert that mentions them.
@@ -519,11 +538,37 @@ impl Solver {
         // arguments and congruence over the application can fire.
         let term = self.abstract_compound_bool_args(term, manager);
         // Purify numeric (Int/Real) UF-application arguments into fresh shared
-        // variables.  `track_theory_vars` does not intern UF arguments, so a
-        // constant/compound argument like `f(3)` or `f(fmt1 + 1)` is never an
-        // arithmetic interface term and arithmetic-derived equalities to it
-        // never reach EUF (the QF_UFLIA/QF_UFIDL false-SAT root cause).
-        let term = self.purify_numeric_uf_args(term, manager);
+        // variables (QF_UFLIA/QF_UFIDL): `f(3)` -> `f(v)` + `v = 3` so an
+        // arithmetic-derived equality reaches EUF and congruence fires.
+        // Gated OFF for the NIA family (QF_NIA/QF_ANIA/QF_NRA/QF_NIRA): there
+        // the grammar-driven `purify_arith` below owns purification, and this
+        // UF-arg rewrite would mangle the array `select`s the NIA ground search
+        // evaluates directly (regressed the QF_ANIA CE cases to Unknown).
+        let skip_uf_purify = matches!(
+            self.logic.as_deref(),
+            Some(l) if l.contains("NIA") || l.contains("NRA") || l.contains("NIRA")
+        );
+        let term = if skip_uf_purify {
+            term
+        } else {
+            self.purify_numeric_uf_args(term, manager)
+        };
+        // Grammar-driven arithmetic purification (QF_ANIA): under +,-,*,div,mod
+        // and arith comparisons, replace non-arith numeric subterms (select,
+        // compound, …) with fresh constants + interface equalities, so NIA sees
+        // pure polynomials.  Gated to NIA/NRA/NIRA/`ALL` — it rewrites foreign
+        // numeric subterms (notably `str.len`/`str.indexof` in QF_S) into fresh
+        // vars the string theory cannot consume.
+        let purify = match self.logic.as_deref() {
+            None | Some("ALL") => true,
+            Some(l) => l.contains("NIA") || l.contains("NRA") || l.contains("NIRA"),
+        };
+        let purified = if purify {
+            super::purify_arith::purify_assertion(term, manager, &mut self.arith_purify)
+        } else {
+            super::purify_arith::PurifyResult { term, interface: Vec::new() }
+        };
+        let term = purified.term;
 
         let index = self.assertions.len();
         self.assertions.push(term);

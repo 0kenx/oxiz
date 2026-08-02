@@ -197,6 +197,7 @@ impl super::Solver {
             encode_depth_exceeded: _, // SNAPSHOT
             has_array_ops: _, // SNAPSHOT
             array_axiom_instances: _, // TRAIL: ArrayAxiomInstanceAdded
+            arith_purify: _,  // rebuilt from assertions each check
             arith_defined_terms: _, // TRAIL: ArithDefinedTermAdded
             arith_const_axiom_pairs: _, // TRAIL: ArithConstAxiomAdded
             care_split_pairs: _, // TRAIL: CareSplitAdded

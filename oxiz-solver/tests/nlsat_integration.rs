@@ -33,6 +33,103 @@ fn test_nia_x_squared_eq_4_sat() {
     );
 }
 
+/// Regression: NL dispatch used to return `Sat` without installing a model, so
+/// `(get-model)` emitted `(error "No model available")` after a successful
+/// `check-sat`. The model must be present and assign `x` to ±2.
+#[test]
+fn test_nia_sat_provides_get_model() {
+    let mut ctx = Context::new();
+    ctx.set_logic("QF_NIA");
+
+    let int_sort = ctx.terms.sorts.int_sort;
+    let x = ctx.declare_const("x", int_sort);
+    let y = ctx.declare_const("y", int_sort);
+    let square = ctx.terms.mk_mul(vec![x, x]);
+    let four = ctx.terms.mk_int(4);
+    let eq_sq = ctx.terms.mk_eq(square, four);
+    ctx.assert(eq_sq);
+    let two = ctx.terms.mk_int(2);
+    let two_x = ctx.terms.mk_mul(vec![two, x]);
+    let eq_y = ctx.terms.mk_eq(y, two_x);
+    ctx.assert(eq_y);
+
+    assert_eq!(ctx.check_sat(), SolverResult::Sat);
+
+    let model = ctx
+        .get_model()
+        .expect("Sat from NL dispatch must install a model for get-model");
+    let formatted = ctx.format_model();
+    assert!(
+        !formatted.contains("No model available"),
+        "get-model must not error after sat, got: {formatted}"
+    );
+
+    let mut x_val = None;
+    let mut y_val = None;
+    for (name, _sort, value) in &model {
+        match name.as_str() {
+            "x" => x_val = Some(value.clone()),
+            "y" => y_val = Some(value.clone()),
+            _ => {}
+        }
+    }
+    let x_val = x_val.expect("model must assign x");
+    let y_val = y_val.expect("model must assign y");
+    // x ∈ {2, -2}, y = 2x
+    assert!(x_val == "2" || x_val == "-2", "x must be ±2, got {x_val}");
+    let expected_y = if x_val == "2" { "4" } else { "-4" };
+    assert_eq!(y_val, expected_y, "y must equal 2*x");
+}
+
+/// Under `(set-logic ALL)`, nonlinear integer formulas must still engage the
+/// NIA dispatch (formula-shape auto-detect) rather than falling through to
+/// an honest `unknown`.
+#[test]
+fn test_all_logic_nia_auto_detect_sat() {
+    let mut ctx = Context::new();
+    ctx.set_logic("ALL");
+
+    let int_sort = ctx.terms.sorts.int_sort;
+    let x = ctx.declare_const("x", int_sort);
+    let square = ctx.terms.mk_mul(vec![x, x]);
+    let four = ctx.terms.mk_int(4);
+    let eq = ctx.terms.mk_eq(square, four);
+    ctx.assert(eq);
+
+    assert_eq!(
+        ctx.check_sat(),
+        SolverResult::Sat,
+        "ALL + x*x=4 must auto-detect NIA and return sat"
+    );
+    let model = ctx.get_model().expect("model after sat under ALL");
+    let x_val = model
+        .iter()
+        .find(|(n, _, _)| n == "x")
+        .map(|(_, _, v)| v.as_str())
+        .expect("x in model");
+    assert!(x_val == "2" || x_val == "-2", "x must be ±2, got {x_val}");
+}
+
+/// Pure-real nonlinear under `ALL` should engage NRA, not be stuck on unknown.
+#[test]
+fn test_all_logic_nra_auto_detect_sat() {
+    let mut ctx = Context::new();
+    ctx.set_logic("ALL");
+
+    let real_sort = ctx.terms.sorts.real_sort;
+    let x = ctx.declare_const("x", real_sort);
+    let square = ctx.terms.mk_mul(vec![x, x]);
+    let four = ctx.terms.mk_real(num_rational::Rational64::from_integer(4));
+    let eq = ctx.terms.mk_eq(square, four);
+    ctx.assert(eq);
+
+    assert_eq!(
+        ctx.check_sat(),
+        SolverResult::Sat,
+        "ALL + real x*x=4 must auto-detect NRA and return sat"
+    );
+}
+
 #[test]
 fn test_nia_x_squared_eq_3_unsat() {
     // x * x = 3 → UNSAT (3 is not a perfect square)

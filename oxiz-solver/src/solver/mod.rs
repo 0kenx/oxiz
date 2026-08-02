@@ -20,6 +20,7 @@ pub(super) mod ite_table;
 pub(super) mod model_builder;
 pub(super) mod model_eval;
 pub(super) mod pigeonhole;
+pub(super) mod purify_arith;
 pub(super) mod term_walk;
 pub(super) mod theory_bv_encode;
 pub(super) mod theory_manager;
@@ -156,6 +157,10 @@ pub struct Solver {
     pub(super) ite_result_terms: FxHashSet<TermId>,
     /// Care-graph split pairs for trailed dedup.
     pub(super) care_split_pairs: FxHashSet<(TermId, TermId)>,
+    /// Grammar-driven arithmetic purification state (QF_ANIA): rewrites
+    /// non-polynomial numeric subterms (select, compound, …) under arith
+    /// operators into fresh shared vars so NIA sees pure polynomials.
+    pub(super) arith_purify: purify_arith::PurifyState,
     /// Index terms of equality-`ite` lookup tables flattened by
     /// [`Solver::flatten_eq_ite_tables`].  Used for eager finite-domain case
     /// splits so CDCL pins `(= idx k)` and table covering clauses unit-propagate.
@@ -435,6 +440,7 @@ impl Solver {
             arith_terms: FxHashSet::default(),
             ite_result_terms: FxHashSet::default(),
             care_split_pairs: FxHashSet::default(),
+            arith_purify: purify_arith::PurifyState::new(),
             table_index_terms: FxHashSet::default(),
             table_index_domain_eqs: FxHashMap::default(),
             zero_one_terms: FxHashSet::default(),
