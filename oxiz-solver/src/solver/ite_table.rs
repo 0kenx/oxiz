@@ -20,8 +20,8 @@ use oxiz_core::sort::SortId;
 use oxiz_sat::Lit;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::types::Constraint;
 use super::Solver;
+use super::types::Constraint;
 
 const MIN_TABLE_CASES: usize = 4;
 const MAX_EAGER_TABLE_DOMAIN: i64 = 64;
@@ -138,9 +138,7 @@ impl Solver {
                 const_vals.sort_unstable();
                 const_vals.dedup();
                 // Track 0/1 images for nest folding + result domain split.
-                if !const_vals.is_empty()
-                    && const_vals.iter().all(|&v| v == 0 || v == 1)
-                {
+                if !const_vals.is_empty() && const_vals.iter().all(|&v| v == 0 || v == 1) {
                     self.zero_one_terms.insert(r);
                     self.binary_table_results.insert(r);
                 }
@@ -170,7 +168,8 @@ impl Solver {
         if map.is_empty() || self.unit_eq_rep.is_empty() {
             return;
         }
-        let snapshot: Vec<(TermId, TermId)> = self.unit_eq_rep.iter().map(|(&k, &v)| (k, v)).collect();
+        let snapshot: Vec<(TermId, TermId)> =
+            self.unit_eq_rep.iter().map(|(&k, &v)| (k, v)).collect();
         for (body, rep) in snapshot {
             let body2 = manager.substitute(body, map);
             if body2 != body {
@@ -286,11 +285,7 @@ impl Solver {
     /// we have processed `(= Name body)`, subsequent assertions that still carry
     /// the raw `body` DAG should mention `Name` instead — otherwise Discord/EM/R
     /// are re-flattened on every mention (catastrophic on qi_1_h1).
-    pub(super) fn fold_unit_eq_reps(
-        &mut self,
-        term: TermId,
-        manager: &mut TermManager,
-    ) -> TermId {
+    pub(super) fn fold_unit_eq_reps(&mut self, term: TermId, manager: &mut TermManager) -> TermId {
         // The alias fold exists to give flattened table indices their define-fun
         // names; without tables it only churns through ordinary `(= var var)`
         // constraint equalities (tens of thousands on ite-heavy QF_UF), so gate
@@ -357,12 +352,7 @@ impl Solver {
         let dbg = std::env::var("OXIZ_DBG_ITE").is_ok();
         let mut bounds: FxHashMap<TermId, (Option<i64>, Option<i64>)> = FxHashMap::default();
         for &assertion in &self.assertions {
-            collect_conjunctive_int_bounds(
-                assertion,
-                manager,
-                &mut bounds,
-                &self.unit_eq_rep,
-            );
+            collect_conjunctive_int_bounds(assertion, manager, &mut bounds, &self.unit_eq_rep);
         }
 
         // Group indices by representative so we case-split each domain once.
@@ -419,7 +409,7 @@ impl Solver {
                 (Some(lo), Some(hi)) if hi >= lo && hi - lo <= MAX_EAGER_TABLE_DOMAIN => {
                     Some((lo..=hi).collect())
                 }
-                (None, Some(hi)) if hi >= 0 && hi <= MAX_EAGER_TABLE_DOMAIN => {
+                (None, Some(hi)) if (0..=MAX_EAGER_TABLE_DOMAIN).contains(&hi) => {
                     let lo = keys.iter().copied().min().unwrap_or(0).max(0);
                     if lo <= hi {
                         Some((lo..=hi).collect())
@@ -474,13 +464,16 @@ impl Solver {
             self.sat.add_clause(lits.clone());
             for i in 0..lits.len() {
                 for j in (i + 1)..lits.len() {
-                    self.sat
-                        .add_clause([lits[i].negate(), lits[j].negate()]);
+                    self.sat.add_clause([lits[i].negate(), lits[j].negate()]);
                 }
             }
             // Decide domain equalities early; weight by table payload so
             // high-value keys (e.g. R9 scores) are tried first.
-            let scores = self.table_index_key_score.get(&rep).cloned().unwrap_or_default();
+            let scores = self
+                .table_index_key_score
+                .get(&rep)
+                .cloned()
+                .unwrap_or_default();
             let max_score = scores.values().copied().max().unwrap_or(0).max(1);
             let rep_total: i64 = scores.values().sum();
             // Sort keys by payload for this index.
@@ -488,7 +481,7 @@ impl Solver {
                 .iter()
                 .map(|&(k, lit)| (scores.get(&k).copied().unwrap_or(0), lit))
                 .collect();
-            keyed.sort_by(|a, b| b.0.cmp(&a.0));
+            keyed.sort_by_key(|x| std::cmp::Reverse(x.0));
             // Only force-priority the top keys of large domains (rest via VSIDS).
             let top_n = if vals.len() <= 8 {
                 vals.len()
@@ -522,7 +515,10 @@ impl Solver {
                     .then_with(|| b.1.cmp(&a.1))
                     .then_with(|| a.2.index().cmp(&b.2.index()))
             });
-            let vars: Vec<_> = domain_priority_scored.into_iter().map(|(_, _, v)| v).collect();
+            let vars: Vec<_> = domain_priority_scored
+                .into_iter()
+                .map(|(_, _, v)| v)
+                .collect();
             self.sat.set_domain_priority(vars);
         }
     }
@@ -780,10 +776,7 @@ fn match_eq_ite_table(
     let mut seen_k: FxHashSet<i64> = FxHashSet::default();
     let mut cur = term;
 
-    loop {
-        let Some(tt) = manager.get(cur) else {
-            break;
-        };
+    while let Some(tt) = manager.get(cur) {
         if tt.sort == bool_sort {
             break;
         }
@@ -843,7 +836,6 @@ fn int_const_val(term: TermId, manager: &TermManager) -> Option<i64> {
     }
 }
 
-
 fn collect_conjunctive_int_bounds(
     term: TermId,
     manager: &TermManager,
@@ -864,7 +856,8 @@ fn collect_conjunctive_int_bounds(
         TermKind::Le(a, b) => note_le(*a, *b, false, manager, bounds, aliases),
         TermKind::Lt(a, b) => note_le(*a, *b, true, manager, bounds, aliases),
         TermKind::Eq(a, b) => {
-            if let (Some(v), Some(c)) = (bound_term(*a, manager, aliases), int_const_val(*b, manager))
+            if let (Some(v), Some(c)) =
+                (bound_term(*a, manager, aliases), int_const_val(*b, manager))
             {
                 let e = bounds.entry(v).or_insert((None, None));
                 e.0 = Some(e.0.map_or(c, |x| x.max(c)));
@@ -908,7 +901,8 @@ fn note_ge(
         let lo = if strict { c + 1 } else { c };
         let e = bounds.entry(v).or_insert((None, None));
         e.0 = Some(e.0.map_or(lo, |x| x.max(lo)));
-    } else if let (Some(c), Some(v)) = (int_const_val(a, manager), bound_term(b, manager, aliases)) {
+    } else if let (Some(c), Some(v)) = (int_const_val(a, manager), bound_term(b, manager, aliases))
+    {
         let hi = if strict { c - 1 } else { c };
         let e = bounds.entry(v).or_insert((None, None));
         e.1 = Some(e.1.map_or(hi, |x| x.min(hi)));
@@ -932,7 +926,8 @@ fn note_le(
             let e2 = bounds.entry(a).or_insert((None, None));
             e2.1 = Some(e2.1.map_or(hi, |x| x.min(hi)));
         }
-    } else if let (Some(c), Some(v)) = (int_const_val(a, manager), bound_term(b, manager, aliases)) {
+    } else if let (Some(c), Some(v)) = (int_const_val(a, manager), bound_term(b, manager, aliases))
+    {
         let lo = if strict { c + 1 } else { c };
         let e = bounds.entry(v).or_insert((None, None));
         e.0 = Some(e.0.map_or(lo, |x| x.max(lo)));
