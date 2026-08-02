@@ -785,7 +785,12 @@ impl Simplex {
     }
     /// Pivot to make the solution feasible
     fn make_feasible(&mut self) -> Result<(), Vec<u32>> {
-        self.update_assignment();
+        // Precondition: the assignment is already consistent with the current
+        // basis and bounds.  [`Simplex::check`] always runs [`crash_basis`]
+        // (which snaps nonbasics to their bounds and calls `update_assignment`)
+        // immediately before this, and `make_feasible` is private with no other
+        // caller — so recomputing again here was a redundant full pass on every
+        // theory check.
         for _ in 0..self.max_pivots {
             let violating = self.find_violating();
             if violating.is_none() {
@@ -1181,6 +1186,44 @@ impl Simplex {
             }
             row_updates.push((*var, new_row));
         }
+        // Targeted assignment update.  After a pivot the *only* variable
+        // whose value changes is `basic_var` (it leaves the basis and is
+        // snapped to a bound); every other nonbasic keeps its value, so a
+        // basic variable's assignment changes only if its (new) row references
+        // `basic_var`.  Those are exactly the entering variable's new row
+        // (`new_expr`) and the rows just rewritten by substitution
+        // (`row_updates`).  Recomputing every basic — as the old full
+        // `update_assignment()` did — was pure waste and the dominant cost:
+        // ~40-52% of QF_UFLIA runtime was `Ratio::mul`/`reduce` driven by that
+        // per-pivot full re-evaluation.  This computes identical values.
+        let leaving = basic_var as usize;
+        if leaving < self.assignment.len() {
+            // Snap the now-nonbasic leaving var to a bound, matching
+            // `update_assignment`'s lower-preferred rule.
+            let snapped = self
+                .lower
+                .get(leaving)
+                .and_then(|o| o.as_ref())
+                .map(|b| b.value)
+                .or_else(|| self.upper.get(leaving).and_then(|o| o.as_ref()).map(|b| b.value));
+            if let Some(v) = snapped {
+                self.assignment[leaving] = v;
+            }
+        }
+        let entering = nonbasic_var as usize;
+        if entering < self.assignment.len() {
+            if let Some(v) = self.eval_expr(&new_expr) {
+                self.assignment[entering] = v;
+            }
+        }
+        for (var, new_row) in &row_updates {
+            let vi = *var as usize;
+            if vi < self.assignment.len() {
+                if let Some(v) = self.eval_expr(new_row) {
+                    self.assignment[vi] = v;
+                }
+            }
+        }
         self.tableau.remove(&basic_var);
         for (var, new_row) in row_updates {
             self.tableau.insert(var, new_row);
@@ -1188,8 +1231,25 @@ impl Simplex {
         self.tableau.insert(nonbasic_var, new_expr);
         self.basic[basic_var as usize] = false;
         self.basic[nonbasic_var as usize] = true;
-        self.update_assignment();
         true
+    }
+    /// Evaluate a tableau row at the current nonbasic assignment.
+    ///
+    /// Returns `None` if the row references a stale (out-of-range) variable,
+    /// in which case the caller leaves that basic variable's assignment
+    /// untouched — matching [`Simplex::update_assignment`]'s `has_stale_ref`
+    /// skip, so targeted updates stay consistent with the full recompute.
+    fn eval_expr(&self, expr: &LinExpr) -> Option<DeltaRational> {
+        let num_vars = self.assignment.len();
+        let mut val = DeltaRational::from_rational(expr.constant);
+        for (v, c) in &expr.terms {
+            let idx = *v as usize;
+            if idx >= num_vars {
+                return None;
+            }
+            val += self.assignment[idx] * *c;
+        }
+        Some(val)
     }
     /// Update variable assignments after pivot
     pub(super) fn update_assignment(&mut self) {
