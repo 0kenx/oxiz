@@ -195,7 +195,18 @@ pub(crate) struct TheoryManager<'a> {
     /// atom would contribute a currently-*true* literal, violating the
     /// all-literals-false convention `analyze_theory_conflict` relies on and
     /// yielding an unsound lemma.
-    assigned_polarity: FxHashMap<Var, bool>,
+    ///
+    /// Stored as two generation-stamped `Vec`s indexed by `Var` rather than a
+    /// `HashMap`: `on_assignment` fires per atom-assignment during SAT
+    /// propagation, and the per-access hashing was a measurable cost.  This
+    /// map is deliberately *not* pruned on backtrack (`assigned_level` is the
+    /// liveness authority), so `assigned_pol_cur` never changes within a
+    /// manager's lifetime and the stamp check reduces to "was this var ever
+    /// set" -- identical to the previous `HashMap::get` semantics.  A fresh
+    /// `TheoryManager` per `Solver::check` re-initialises all three.
+    assigned_pol_gen: Vec<u32>,
+    assigned_pol_val: Vec<bool>,
+    assigned_pol_cur: u32,
     /// Current SAT decision level, mirrored from `on_new_level` / `on_backtrack`.
     /// Used to stamp shadow-trail entries with the level they hold at.
     current_level: u32,
@@ -208,7 +219,7 @@ pub(crate) struct TheoryManager<'a> {
     /// Map from a theory variable to its index in `assignment_trail`, for O(1)
     /// flip detection.  Rebuilt whenever the trail is truncated on backtrack.
     trail_index: FxHashMap<Var, usize>,
-    /// Decision level at which each entry of `assigned_polarity` currently
+    /// Decision level at which each entry of the polarity map currently
     /// holds, pruned on backtrack.  Unlike `assignment_trail` this is
     /// maintained in *both* eager and lazy theory modes, because it backs
     /// [`Self::full_assignment_conflict_clause`] — the sound fallback used
@@ -308,7 +319,9 @@ impl<'a> TheoryManager<'a> {
             unjustified_conflict: false,
             #[cfg(feature = "std")]
             deadline,
-            assigned_polarity: FxHashMap::default(),
+            assigned_pol_gen: Vec::new(),
+            assigned_pol_val: Vec::new(),
+            assigned_pol_cur: 1,
             current_level: 0,
             assignment_trail: Vec::new(),
             trail_index: FxHashMap::default(),
@@ -367,7 +380,28 @@ impl<'a> TheoryManager<'a> {
     /// unassigned (not yet decided/propagated by the SAT core).
     #[inline]
     fn assigned_pol_of(&self, var: Var) -> Option<bool> {
-        self.assigned_polarity.get(&var).copied()
+        let idx = var.index();
+        // `assigned_pol_cur` is constant within a manager (this map is never
+        // cleared -- `assigned_level` is the liveness authority), so a stamp
+        // equal to `cur` simply means "this var was set at some point".
+        let stamp = *self.assigned_pol_gen.get(idx)?;
+        if stamp == self.assigned_pol_cur {
+            Some(self.assigned_pol_val[idx])
+        } else {
+            None
+        }
+    }
+
+    /// Record `var`'s current polarity (direct-indexed, generation-stamped).
+    #[inline]
+    fn set_assigned_polarity(&mut self, var: Var, polarity: bool) {
+        let idx = var.index();
+        if idx >= self.assigned_pol_gen.len() {
+            self.assigned_pol_gen.resize(idx + 1, 0);
+            self.assigned_pol_val.resize(idx + 1, false);
+        }
+        self.assigned_pol_gen[idx] = self.assigned_pol_cur;
+        self.assigned_pol_val[idx] = polarity;
     }
 
     /// Returns `true` once the configured wall-clock deadline has passed.
@@ -1854,7 +1888,7 @@ impl TheoryCallback for TheoryManager<'_> {
         // correct (currently-false) literal for this variable, and the level it
         // holds at so `full_assignment_conflict_clause` never names a literal
         // the SAT core has since unassigned.
-        self.assigned_polarity.insert(var, is_positive);
+        self.set_assigned_polarity(var, is_positive);
         self.assigned_level.insert(var, self.current_level);
 
         // Mirror the assignment into the embedded BV solver's boolean-node
@@ -2013,7 +2047,7 @@ impl TheoryCallback for TheoryManager<'_> {
         if self.theory_mode == TheoryMode::Lazy {
             for &(lit, is_positive) in &self.pending_assignments.clone() {
                 let var = lit.var();
-                self.assigned_polarity.insert(var, is_positive);
+                self.set_assigned_polarity(var, is_positive);
                 let Some(constraint) = self.var_to_constraint.get(&var).cloned() else {
                     continue;
                 };

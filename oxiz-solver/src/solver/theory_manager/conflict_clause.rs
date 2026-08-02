@@ -175,9 +175,9 @@ impl TheoryManager<'_> {
     ///
     /// A term that names no SAT variable at all is not a literal and cannot go
     /// stale — it resolves through the tautology / derived-equality cases
-    /// instead, so it counts as live here.  `assigned_level` (not
-    /// `assigned_polarity`) is the authority: it is the map pruned on backtrack,
-    /// so an entry means the assignment still holds.  `assigned_polarity` is
+    /// instead, so it counts as live here.  `assigned_level` (not the polarity
+    /// map) is the authority: it is the map pruned on backtrack,
+    /// so an entry means the assignment still holds.  The polarity map is
     /// deliberately *not* pruned and therefore outlives the assignment it
     /// describes; reading it would call a retracted literal live.
     fn reason_literal_is_live(&self, term: TermId) -> bool {
@@ -195,7 +195,7 @@ impl TheoryManager<'_> {
     /// application assigned false all store their term as a theory reason.
     #[inline]
     fn false_literal_of(&self, var: Var) -> Lit {
-        match self.assigned_polarity.get(&var) {
+        match self.assigned_pol_of(var) {
             // Atom currently true  → its false literal is ¬var.
             Some(true) => Lit::neg(var),
             // Atom currently false → its false literal is var.
@@ -203,7 +203,7 @@ impl TheoryManager<'_> {
             // Polarity unknown.  Unreachable from `terms_to_conflict_clause`,
             // which now rejects any reason atom missing from `assigned_level`,
             // and `on_assignment` writes both maps together — so an entry in
-            // `assigned_level` implies one in `assigned_polarity`.  Kept as a
+            // `assigned_level` implies one in the polarity map.  Kept as a
             // total fallback for `full_assignment_conflict_clause`, matching
             // legacy behaviour rather than introducing a panic path.
             None => Lit::neg(var),
@@ -356,9 +356,9 @@ mod tests {
         let true_var = Var::new(0);
         let false_var = Var::new(1);
         manager.assigned_level.insert(true_var, 0);
-        manager.assigned_polarity.insert(true_var, true);
+        manager.set_assigned_polarity(true_var, true);
         manager.assigned_level.insert(false_var, 0);
-        manager.assigned_polarity.insert(false_var, false);
+        manager.set_assigned_polarity(false_var, false);
 
         let clause = manager
             .full_assignment_conflict_clause()
