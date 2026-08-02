@@ -45,7 +45,11 @@ fn checked_ratio_i128(numer: i128, denom: i128) -> Option<Rational64> {
     if !(i64::MIN as i128..=i64::MAX as i128).contains(&n) || d > i64::MAX as i128 {
         return None;
     }
-    Some(Rational64::new(n as i64, d as i64))
+    // `new_raw` (not `new`): we already reduced by `g` above and ensured
+    // `d > 0`, so the fraction is in canonical form and `new`'s second gcd
+    // pass would be pure redundant work (`reduce` was ~20% of simplex
+    // runtime).
+    Some(Rational64::new_raw(n as i64, d as i64))
 }
 /// Checked rational multiplication: `a * b`, via `i128` intermediates.
 /// Returns `None` on overflow instead of silently wrapping (the `i64`-based
@@ -82,7 +86,9 @@ fn checked_neg_r64(a: Rational64) -> Option<Rational64> {
     if !(i64::MIN as i128..=i64::MAX as i128).contains(&n) {
         return None;
     }
-    Some(Rational64::new(n as i64, *a.denom()))
+    // `new_raw`: negating the numerator preserves the reduced form and the
+    // denominator is already positive.
+    Some(Rational64::new_raw(n as i64, *a.denom()))
 }
 /// Checked rational reciprocal: `1 / a`. Returns `None` if `a` is zero.
 fn checked_recip_r64(a: Rational64) -> Option<Rational64> {

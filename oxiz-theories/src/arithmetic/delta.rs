@@ -136,11 +136,29 @@ impl From<Rational64> for DeltaRational {
         Self::from_rational(r)
     }
 }
-
 impl From<i64> for DeltaRational {
     fn from(n: i64) -> Self {
         Self::from_rational(Rational64::from_integer(n))
     }
+}
+
+/// Rational multiplication with an integer fast-path.
+///
+/// Coefficients and many simplex values are integers (denominator 1) in
+/// QF_LIA, but `num_rational`'s `Ratio::mul` still runs cross-gcd reduction
+/// on every multiply — the single largest cost in the simplex profile (~25%).
+/// When both operands are integers the product is `new_raw(a.n*b.n, 1)` with
+/// no gcd at all; otherwise we fall back to `Ratio::mul`.  `new_raw` is valid
+/// here because `(n, 1)` is already reduced with a positive denominator.
+/// Overflow in the fast path falls back to the (wrapping) `Ratio::mul`, which
+/// matches the previous unchecked behaviour.
+fn mul_r64_fast(a: Rational64, b: Rational64) -> Rational64 {
+    if *a.denom() == 1 && *b.denom() == 1 {
+        if let Some(n) = (*a.numer()).checked_mul(*b.numer()) {
+            return Rational64::new_raw(n, 1);
+        }
+    }
+    a * b
 }
 
 impl PartialEq for DeltaRational {
@@ -218,16 +236,16 @@ impl Mul<Rational64> for DeltaRational {
 
     fn mul(self, rhs: Rational64) -> Self::Output {
         Self {
-            real: self.real * rhs,
-            delta: self.delta * rhs,
+            real: mul_r64_fast(self.real, rhs),
+            delta: mul_r64_fast(self.delta, rhs),
         }
     }
 }
 
 impl MulAssign<Rational64> for DeltaRational {
     fn mul_assign(&mut self, rhs: Rational64) {
-        self.real *= rhs;
-        self.delta *= rhs;
+        self.real = mul_r64_fast(self.real, rhs);
+        self.delta = mul_r64_fast(self.delta, rhs);
     }
 }
 
@@ -309,5 +327,23 @@ mod tests {
         let scaled = a * Rational64::from_integer(2);
         assert_eq!(scaled.real, Rational64::from_integer(6));
         assert_eq!(scaled.delta, Rational64::from_integer(2));
+    }
+
+    #[test]
+    fn test_mul_r64_fast() {
+        // Integer × integer: fast-path must equal `Ratio::mul` and stay reduced.
+        assert_eq!(mul_r64_fast(Rational64::from_integer(6), Rational64::from_integer(7)), Rational64::from_integer(42));
+        assert_eq!(mul_r64_fast(Rational64::from_integer(-4), Rational64::from_integer(5)), Rational64::from_integer(-20));
+        assert_eq!(mul_r64_fast(Rational64::from_integer(0), Rational64::from_integer(9)), Rational64::from_integer(0));
+        // Fraction × integer falls back to `Ratio::mul`.
+        let half = Rational64::new(1, 2);
+        assert_eq!(mul_r64_fast(half, Rational64::from_integer(6)), Rational64::from_integer(3));
+        // Fraction × fraction: full reduction.
+        assert_eq!(mul_r64_fast(Rational64::new(2, 3), Rational64::new(3, 4)), Rational64::new(1, 2));
+        // The fast-path result must satisfy the canonical-form invariant
+        // (reduced, positive denominator) so downstream `Ratio` ops stay sound.
+        let p = mul_r64_fast(Rational64::from_integer(-3), Rational64::from_integer(-2));
+        assert_eq!(*p.numer(), 6);
+        assert_eq!(*p.denom(), 1);
     }
 }
