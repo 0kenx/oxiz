@@ -850,6 +850,17 @@ impl<'a> TheoryManager<'a> {
                 let l_node = self.euf.intern(x);
                 let r_node = self.euf.intern(y);
                 if self.euf.are_equal(l_node, r_node) { continue; }
+                // Cheap sound pre-filter: if the current arithmetic model
+                // assigns x and y *different* values, then arithmetic does NOT
+                // entail x = y -- a satisfying model exists with x != y, so the
+                // equal-entailment probe (two simplex feasibility checks)
+                // would return None.  Skip it.  On SAT instances nearly every
+                // spurious difference-constraint / live-diseq candidate pair
+                // has distinct model values, so this prunes the hundreds of
+                // wasted probes per call to the handful that are model-equal.
+                if let (Some(a), Some(b)) = (self.arith.value(x), self.arith.value(y)) {
+                    if a != b { continue; }
+                }
                 let Some(reason) = self.arith.entailed_equal_reason(x, y) else { continue; };
                 self.derived_reasons.record(x, reason);
                 let _ = self.euf.merge(l_node, r_node, x);
